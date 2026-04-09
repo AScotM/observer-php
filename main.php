@@ -13,6 +13,7 @@ final class ConsoleColor
     public const MAGENTA = "\033[35m";
     public const BLUE = "\033[34m";
     public const WHITE = "\033[37m";
+    public const BOLD = "\033[1m";
 
     public static function wrap(string $text, string $color, bool $enabled): string
     {
@@ -20,6 +21,14 @@ final class ConsoleColor
             return $text;
         }
         return $color . $text . self::RESET;
+    }
+
+    public static function wrapBold(string $text, bool $enabled): string
+    {
+        if (!$enabled) {
+            return $text;
+        }
+        return self::BOLD . $text . self::RESET;
     }
 }
 
@@ -37,6 +46,10 @@ final class JsonFile
         }
 
         $data = json_decode($content, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new RuntimeException("Invalid JSON in file: $path - " . json_last_error_msg());
+        }
+
         if (!is_array($data)) {
             throw new RuntimeException("File does not contain a valid JSON object: $path");
         }
@@ -58,7 +71,7 @@ final class JsonFile
             }
         }
 
-        $tmp = $path . '.tmp';
+        $tmp = $path . '.tmp.' . getmypid();
         if (@file_put_contents($tmp, $json . PHP_EOL, LOCK_EX) === false) {
             throw new RuntimeException("Failed to write temporary file: $tmp");
         }
@@ -97,6 +110,72 @@ final class FileReader
 
         $int = (int)$value;
         return $int >= 0 ? $int : null;
+    }
+}
+
+final class ProcessExecutor
+{
+    public static function execute(string $command, int $timeoutSeconds = 5): array
+    {
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+
+        $process = @proc_open($command, $descriptors, $pipes);
+        if (!is_resource($process)) {
+            return ['output' => [], 'code' => -1, 'errors' => ''];
+        }
+
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+
+        $output = [];
+        $errors = '';
+        $startTime = microtime(true);
+
+        while (true) {
+            $read = [$pipes[1], $pipes[2]];
+            $write = null;
+            $except = null;
+
+            if (stream_select($read, $write, $except, 0, 200000) === false) {
+                break;
+            }
+
+            foreach ($read as $stream) {
+                $chunk = fread($stream, 8192);
+                if ($chunk === false || $chunk === '') {
+                    continue;
+                }
+                if ($stream === $pipes[1]) {
+                    $output[] = $chunk;
+                } else {
+                    $errors .= $chunk;
+                }
+            }
+
+            $status = proc_get_status($process);
+            if (!$status['running']) {
+                break;
+            }
+
+            if ((microtime(true) - $startTime) > $timeoutSeconds) {
+                proc_terminate($process, 9);
+                break;
+            }
+        }
+
+        foreach ($pipes as $pipe) {
+            fclose($pipe);
+        }
+
+        $code = proc_close($process);
+        $fullOutput = explode("\n", trim(implode('', $output)));
+        $fullOutput = array_filter($fullOutput, fn($line) => $line !== '');
+
+        return ['output' => array_values($fullOutput), 'code' => $code, 'errors' => $errors];
     }
 }
 
@@ -361,6 +440,13 @@ final class Manifest
 
     public static function fromArray(array $data): self
     {
+        $requiredFields = ['hostname', 'timestamp_epoch', 'cpu_count'];
+        foreach ($requiredFields as $field) {
+            if (!array_key_exists($field, $data)) {
+                throw new RuntimeException("Missing required field in manifest: $field");
+            }
+        }
+
         $interfaces = [];
         $rawInterfaces = $data['interfaces'] ?? [];
         if (is_array($rawInterfaces)) {
@@ -450,13 +536,17 @@ final class InterfaceCollector
             }
 
             [$rxBytes, $txBytes] = self::readRxTxBytes($name);
+            $speed = FileReader::readNullableInt($base . '/' . $name . '/speed');
+            if ($speed === -1) {
+                $speed = null;
+            }
 
             $interfaces[] = new NetworkInterface(
                 $name,
                 FileReader::readText($base . '/' . $name . '/address'),
                 FileReader::readText($base . '/' . $name . '/operstate'),
                 FileReader::readInt($base . '/' . $name . '/mtu'),
-                FileReader::readNullableInt($base . '/' . $name . '/speed'),
+                $speed,
                 self::ipv4Addresses($name),
                 $rxBytes,
                 $txBytes
@@ -474,17 +564,11 @@ final class InterfaceCollector
     private static function ipv4Addresses(string $name): array
     {
         $ips = [];
-        $output = [];
-        $code = 0;
+        $command = 'ip -4 -o addr show dev ' . escapeshellarg($name) . ' 2>/dev/null';
+        $result = ProcessExecutor::execute($command, 3);
 
-        @exec(
-            'ip -4 -o addr show dev ' . escapeshellarg($name) . ' 2>/dev/null',
-            $output,
-            $code
-        );
-
-        if ($code === 0) {
-            foreach ($output as $line) {
+        if ($result['code'] === 0) {
+            foreach ($result['output'] as $line) {
                 if (preg_match('/\binet\s+(\d+\.\d+\.\d+\.\d+)\/\d+/', $line, $matches)) {
                     $ip = $matches[1];
                     if (!str_starts_with($ip, '127.')) {
@@ -620,6 +704,7 @@ final class ManifestDiff
         return [
             'old_timestamp' => $old->timestamp,
             'new_timestamp' => $new->timestamp,
+            'duration_seconds' => $new->timestampEpoch - $old->timestampEpoch,
             'field_changes' => $fieldChanges,
             'ip_addresses' => [
                 'old' => $oldIps,
@@ -649,11 +734,11 @@ final class ManifestDiff
 
 final class Exporter
 {
-    public static function export(string $format, Manifest $manifest): string
+    public static function export(string $format, Manifest $manifest, bool $colors): string
     {
         return match ($format) {
             'json' => self::json($manifest->toArray()),
-            'table' => self::table($manifest),
+            'table' => self::table($manifest, $colors),
             default => throw new InvalidArgumentException("Unsupported format: $format"),
         };
     }
@@ -676,51 +761,57 @@ final class Exporter
         return $json . PHP_EOL;
     }
 
-    private static function table(Manifest $manifest): string
+    private static function table(Manifest $manifest, bool $colors): string
     {
         $lines = [];
-        $lines[] = 'SYSTEM MANIFEST';
+        $lines[] = ConsoleColor::wrapBold('SYSTEM MANIFEST', $colors);
         $lines[] = str_repeat('=', 72);
-        $lines[] = sprintf('%-20s %s', 'Hostname', $manifest->hostname);
-        $lines[] = sprintf('%-20s %s', 'FQDN', $manifest->fqdn);
-        $lines[] = sprintf('%-20s %s', 'Timestamp', $manifest->timestamp);
-        $lines[] = sprintf('%-20s %s', 'OS Release', $manifest->osRelease);
-        $lines[] = sprintf('%-20s %s', 'Kernel', $manifest->kernel);
-        $lines[] = sprintf('%-20s %s', 'Architecture', $manifest->arch);
-        $lines[] = sprintf('%-20s %d', 'CPU Count', $manifest->cpuCount);
-        $lines[] = sprintf('%-20s %.2f', 'Uptime Seconds', $manifest->uptimeSeconds);
-        $lines[] = sprintf('%-20s %s', 'Load Average', implode(', ', array_map(
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Hostname:', ConsoleColor::CYAN, $colors), $manifest->hostname);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('FQDN:', ConsoleColor::CYAN, $colors), $manifest->fqdn);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Timestamp:', ConsoleColor::CYAN, $colors), $manifest->timestamp);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('OS Release:', ConsoleColor::CYAN, $colors), $manifest->osRelease);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Kernel:', ConsoleColor::CYAN, $colors), $manifest->kernel);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Architecture:', ConsoleColor::CYAN, $colors), $manifest->arch);
+        $lines[] = sprintf('%-20s %d', ConsoleColor::wrap('CPU Count:', ConsoleColor::CYAN, $colors), $manifest->cpuCount);
+        $lines[] = sprintf('%-20s %.2f', ConsoleColor::wrap('Uptime Seconds:', ConsoleColor::CYAN, $colors), $manifest->uptimeSeconds);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Load Average:', ConsoleColor::CYAN, $colors), implode(', ', array_map(
             static fn(float $v): string => number_format($v, 2, '.', ''),
             $manifest->loadavg
         )));
-        $lines[] = sprintf('%-20s %s', 'Memory Total', self::humanBytes($manifest->memTotalBytes));
-        $lines[] = sprintf('%-20s %s', 'Memory Available', self::humanBytes($manifest->memAvailableBytes));
-        $lines[] = sprintf('%-20s %s', 'IP Addresses', implode(', ', $manifest->ipAddresses));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Memory Total:', ConsoleColor::CYAN, $colors), self::humanBytes($manifest->memTotalBytes));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Memory Available:', ConsoleColor::CYAN, $colors), self::humanBytes($manifest->memAvailableBytes));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('IP Addresses:', ConsoleColor::CYAN, $colors), implode(', ', $manifest->ipAddresses));
         $lines[] = '';
-        $lines[] = 'INTERFACES';
+        $lines[] = ConsoleColor::wrapBold('INTERFACES', $colors);
         $lines[] = str_repeat('-', 72);
         $lines[] = sprintf(
             '%-12s %-10s %-8s %-8s %-17s %-16s',
-            'Name',
-            'State',
-            'MTU',
-            'Speed',
-            'RX',
-            'TX'
+            ConsoleColor::wrap('Name', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('State', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('MTU', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('Speed', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('RX', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('TX', ConsoleColor::YELLOW, $colors)
         );
 
         foreach ($manifest->interfaces as $iface) {
+            $stateColor = match($iface->operstate) {
+                'up' => ConsoleColor::GREEN,
+                'down' => ConsoleColor::RED,
+                default => ConsoleColor::WHITE,
+            };
+            
             $lines[] = sprintf(
                 '%-12s %-10s %-8d %-8s %-17s %-16s',
-                $iface->name,
-                $iface->operstate,
+                ConsoleColor::wrap($iface->name, ConsoleColor::MAGENTA, $colors),
+                ConsoleColor::wrap($iface->operstate, $stateColor, $colors),
                 $iface->mtu,
                 $iface->speedMbps !== null ? $iface->speedMbps . 'M' : '-',
                 self::humanBytes($iface->rxBytes),
                 self::humanBytes($iface->txBytes)
             );
-            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', 'MAC', $iface->macAddress);
-            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', 'IPv4', implode(', ', $iface->ipv4Addresses));
+            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', ConsoleColor::wrap('MAC:', ConsoleColor::CYAN, $colors), $iface->macAddress);
+            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', ConsoleColor::wrap('IPv4:', ConsoleColor::CYAN, $colors), implode(', ', $iface->ipv4Addresses));
         }
 
         return implode(PHP_EOL, $lines) . PHP_EOL;
@@ -729,13 +820,14 @@ final class Exporter
     private static function diffTable(array $diff, bool $colors): string
     {
         $lines = [];
-        $lines[] = 'MANIFEST DIFF';
+        $lines[] = ConsoleColor::wrapBold('MANIFEST DIFF', $colors);
         $lines[] = str_repeat('=', 72);
-        $lines[] = sprintf('%-20s %s', 'Old Timestamp', (string)($diff['old_timestamp'] ?? ''));
-        $lines[] = sprintf('%-20s %s', 'New Timestamp', (string)($diff['new_timestamp'] ?? ''));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Old Timestamp:', ConsoleColor::CYAN, $colors), (string)($diff['old_timestamp'] ?? ''));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('New Timestamp:', ConsoleColor::CYAN, $colors), (string)($diff['new_timestamp'] ?? ''));
+        $lines[] = sprintf('%-20s %d', ConsoleColor::wrap('Duration Seconds:', ConsoleColor::CYAN, $colors), (int)($diff['duration_seconds'] ?? 0));
         $lines[] = '';
 
-        $lines[] = 'FIELD CHANGES';
+        $lines[] = ConsoleColor::wrapBold('FIELD CHANGES', $colors);
         $lines[] = str_repeat('-', 72);
         $fieldChanges = $diff['field_changes'] ?? [];
         if (is_array($fieldChanges) && $fieldChanges !== []) {
@@ -746,7 +838,7 @@ final class Exporter
                 $field = (string)($change['field'] ?? '');
                 $old = self::stringify($change['old'] ?? null);
                 $new = self::stringify($change['new'] ?? null);
-                $lines[] = $field;
+                $lines[] = ConsoleColor::wrap($field, ConsoleColor::YELLOW, $colors);
                 $lines[] = '  old: ' . ConsoleColor::wrap($old, ConsoleColor::RED, $colors);
                 $lines[] = '  new: ' . ConsoleColor::wrap($new, ConsoleColor::GREEN, $colors);
             }
@@ -755,7 +847,7 @@ final class Exporter
         }
 
         $lines[] = '';
-        $lines[] = 'IP ADDRESS CHANGES';
+        $lines[] = ConsoleColor::wrapBold('IP ADDRESS CHANGES', $colors);
         $lines[] = str_repeat('-', 72);
         $ipSection = is_array($diff['ip_addresses'] ?? null) ? $diff['ip_addresses'] : [];
         $addedIps = is_array($ipSection['added'] ?? null) ? $ipSection['added'] : [];
@@ -773,7 +865,7 @@ final class Exporter
         }
 
         $lines[] = '';
-        $lines[] = 'INTERFACE CHANGES';
+        $lines[] = ConsoleColor::wrapBold('INTERFACE CHANGES', $colors);
         $lines[] = str_repeat('-', 72);
         $ifaceSection = is_array($diff['interfaces'] ?? null) ? $diff['interfaces'] : [];
         $addedIfaces = is_array($ifaceSection['added'] ?? null) ? $ifaceSection['added'] : [];
@@ -803,7 +895,7 @@ final class Exporter
                     $field = (string)($change['field'] ?? '');
                     $old = self::stringify($change['old'] ?? null);
                     $new = self::stringify($change['new'] ?? null);
-                    $lines[] = '    ' . $field;
+                    $lines[] = '    ' . ConsoleColor::wrap($field, ConsoleColor::YELLOW, $colors);
                     $lines[] = '      old: ' . ConsoleColor::wrap($old, ConsoleColor::RED, $colors);
                     $lines[] = '      new: ' . ConsoleColor::wrap($new, ConsoleColor::GREEN, $colors);
                 }
@@ -856,6 +948,7 @@ final class OptionParser
             'format:',
             'help',
             'no-color',
+            'force-color',
         ]);
 
         if (isset($options['help'])) {
@@ -868,11 +961,32 @@ final class OptionParser
             throw new InvalidArgumentException('Format must be json or table');
         }
 
+        $output = isset($options['output']) ? (string)$options['output'] : null;
+        $compare = isset($options['compare']) ? (string)$options['compare'] : null;
+
+        if ($output !== null && $compare !== null) {
+            throw new InvalidArgumentException('Cannot use --output and --compare together');
+        }
+
+        $forceColor = isset($options['force-color']);
+        $noColor = isset($options['no-color']);
+
+        if ($noColor && $forceColor) {
+            throw new InvalidArgumentException('Cannot use --no-color and --force-color together');
+        }
+
+        $colors = false;
+        if ($forceColor) {
+            $colors = true;
+        } elseif (!$noColor) {
+            $colors = self::stdoutIsTty();
+        }
+
         return [
-            'output' => isset($options['output']) ? (string)$options['output'] : null,
-            'compare' => isset($options['compare']) ? (string)$options['compare'] : null,
+            'output' => $output,
+            'compare' => $compare,
             'format' => $format,
-            'colors' => !isset($options['no-color']) && self::stdoutIsTty(),
+            'colors' => $colors,
         ];
     }
 
@@ -898,13 +1012,16 @@ Usage: php {$name} [options]
 Options:
   --output <file>    Write current manifest JSON to file
   --compare <file>   Compare current manifest with saved manifest JSON
-  --format <type>    Output format: json or table
+  --format <type>    Output format: json or table (default: json)
   --no-color         Disable colored output
+  --force-color      Force colored output even when not in a TTY
   --help             Show this help message
 
 Examples:
   php {$name}
   php {$name} --format table
+  php {$name} --force-color --format table
+  php {$name} --force-color --format table | less -R
   php {$name} --output snapshots/node-a.json
   php {$name} --compare snapshots/node-a.json --format table
 
@@ -914,6 +1031,13 @@ TXT;
 
 final class Application
 {
+    private static ?string $logger = null;
+
+    public static function setLogger(string $path): void
+    {
+        self::$logger = $path;
+    }
+
     public static function run(array $argv): int
     {
         try {
@@ -923,19 +1047,23 @@ final class Application
 
             if (is_string($options['output'])) {
                 JsonFile::save($options['output'], $manifest->toArray());
+                self::log("Manifest saved to {$options['output']}");
             }
 
             if (is_string($options['compare'])) {
                 $previous = Manifest::fromArray(JsonFile::load($options['compare']));
                 $diff = ManifestDiff::diff($previous, $manifest);
                 echo Exporter::exportDiff($options['format'], $diff, $options['colors']);
+                self::log("Comparison completed with {$options['compare']}");
                 return 0;
             }
 
-            echo Exporter::export($options['format'], $manifest);
+            echo Exporter::export($options['format'], $manifest, $options['colors']);
             return 0;
         } catch (Throwable $e) {
-            fwrite(STDERR, 'error: ' . $e->getMessage() . PHP_EOL);
+            $message = 'error: ' . $e->getMessage() . PHP_EOL;
+            fwrite(STDERR, $message);
+            self::log($message, true);
             return 1;
         }
     }
@@ -949,6 +1077,23 @@ final class Application
         if (PHP_OS_FAMILY !== 'Linux') {
             throw new RuntimeException('This script is supported on Linux only');
         }
+
+        if (PHP_VERSION_ID < 80200) {
+            throw new RuntimeException('PHP 8.2 or higher is required');
+        }
+    }
+
+    private static function log(string $message, bool $isError = false): void
+    {
+        if (self::$logger === null) {
+            return;
+        }
+
+        $timestamp = date('Y-m-d H:i:s');
+        $prefix = $isError ? 'ERROR' : 'INFO';
+        $logLine = sprintf("[%s] %s: %s\n", $timestamp, $prefix, $message);
+
+        @file_put_contents(self::$logger, $logLine, FILE_APPEND | LOCK_EX);
     }
 }
 
