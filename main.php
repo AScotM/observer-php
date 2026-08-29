@@ -59,26 +59,41 @@ final class JsonFile
 
     public static function save(string $path, array $data): void
     {
-        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        if ($json === false) {
-            throw new RuntimeException('Failed to encode JSON');
-        }
-
+        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $directory = dirname($path);
+
         if ($directory !== '' && $directory !== '.' && !is_dir($directory)) {
             if (!@mkdir($directory, 0755, true) && !is_dir($directory)) {
                 throw new RuntimeException("Failed to create directory: $directory");
             }
         }
 
-        $tmp = $path . '.tmp.' . getmypid();
-        if (@file_put_contents($tmp, $json . PHP_EOL, LOCK_EX) === false) {
-            throw new RuntimeException("Failed to write temporary file: $tmp");
+        $existingMode = null;
+        if (file_exists($path)) {
+            $perms = @fileperms($path);
+            if ($perms !== false) {
+                $existingMode = $perms & 0777;
+            }
         }
 
-        if (!@rename($tmp, $path)) {
-            @unlink($tmp);
-            throw new RuntimeException("Failed to move temporary file into place: $path");
+        $tmp = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+
+        try {
+            if (@file_put_contents($tmp, $json . PHP_EOL, LOCK_EX) === false) {
+                throw new RuntimeException("Failed to write temporary file: $tmp");
+            }
+
+            if ($existingMode !== null && !@chmod($tmp, $existingMode)) {
+                throw new RuntimeException("Failed to preserve file permissions for: $path");
+            }
+
+            if (!@rename($tmp, $path)) {
+                throw new RuntimeException("Failed to move temporary file into place: $path");
+            }
+        } finally {
+            if (file_exists($tmp)) {
+                @unlink($tmp);
+            }
         }
     }
 }
@@ -117,6 +132,10 @@ final class ProcessExecutor
 {
     public static function execute(string $command, int $timeoutSeconds = 5): array
     {
+        if ($timeoutSeconds <= 0) {
+            throw new InvalidArgumentException('Timeout must be positive');
+        }
+
         $descriptors = [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
@@ -128,54 +147,90 @@ final class ProcessExecutor
             return ['output' => [], 'code' => -1, 'errors' => ''];
         }
 
+        fclose($pipes[0]);
         stream_set_blocking($pipes[1], false);
         stream_set_blocking($pipes[2], false);
 
-        $output = [];
-        $errors = '';
-        $startTime = microtime(true);
+        $stdout = '';
+        $stderr = '';
+        $startTime = hrtime(true);
+        $timeoutNanoseconds = $timeoutSeconds * 1_000_000_000;
+        $timedOut = false;
+        $exitCode = null;
 
         while (true) {
-            $read = [$pipes[1], $pipes[2]];
-            $write = null;
-            $except = null;
-
-            if (stream_select($read, $write, $except, 0, 200000) === false) {
-                break;
+            $read = [];
+            if (!feof($pipes[1])) {
+                $read[] = $pipes[1];
+            }
+            if (!feof($pipes[2])) {
+                $read[] = $pipes[2];
             }
 
-            foreach ($read as $stream) {
-                $chunk = fread($stream, 8192);
-                if ($chunk === false || $chunk === '') {
-                    continue;
+            if ($read !== []) {
+                $write = null;
+                $except = null;
+                $selected = @stream_select($read, $write, $except, 0, 200000);
+                if ($selected === false) {
+                    break;
                 }
-                if ($stream === $pipes[1]) {
-                    $output[] = $chunk;
-                } else {
-                    $errors .= $chunk;
+
+                foreach ($read as $stream) {
+                    $chunk = fread($stream, 8192);
+                    if ($chunk === false || $chunk === '') {
+                        continue;
+                    }
+
+                    if ($stream === $pipes[1]) {
+                        $stdout .= $chunk;
+                    } else {
+                        $stderr .= $chunk;
+                    }
                 }
             }
 
             $status = proc_get_status($process);
             if (!$status['running']) {
+                $exitCode = is_int($status['exitcode']) && $status['exitcode'] >= 0 ? $status['exitcode'] : null;
                 break;
             }
 
-            if ((microtime(true) - $startTime) > $timeoutSeconds) {
-                proc_terminate($process, 9);
+            if ((hrtime(true) - $startTime) > $timeoutNanoseconds) {
+                $timedOut = true;
+                @proc_terminate($process, 15);
+                usleep(100000);
+                $status = proc_get_status($process);
+                if ($status['running']) {
+                    @proc_terminate($process, 9);
+                }
                 break;
             }
         }
 
-        foreach ($pipes as $pipe) {
-            fclose($pipe);
+        stream_set_blocking($pipes[1], true);
+        stream_set_blocking($pipes[2], true);
+        $remainingStdout = stream_get_contents($pipes[1]);
+        $remainingStderr = stream_get_contents($pipes[2]);
+        if ($remainingStdout !== false) {
+            $stdout .= $remainingStdout;
+        }
+        if ($remainingStderr !== false) {
+            $stderr .= $remainingStderr;
         }
 
-        $code = proc_close($process);
-        $fullOutput = explode("\n", trim(implode('', $output)));
-        $fullOutput = array_filter($fullOutput, fn($line) => $line !== '');
+        fclose($pipes[1]);
+        fclose($pipes[2]);
 
-        return ['output' => array_values($fullOutput), 'code' => $code, 'errors' => $errors];
+        $closedCode = proc_close($process);
+        $code = $timedOut ? 124 : ($exitCode ?? $closedCode);
+        $lines = preg_split('/\R/', trim($stdout));
+        if ($lines === false || $stdout === '') {
+            $lines = [];
+        }
+
+        $lines = array_values(array_filter($lines, static fn(string $line): bool => $line !== ''));
+
+        return ['output' => $lines, 'code' => $code, 'errors' => trim($stderr)];
     }
 }
 
@@ -336,6 +391,8 @@ final class HostInfo
 
 final class NetworkInterface
 {
+    private const VALID_STATES = ['unknown', 'notpresent', 'down', 'lowerlayerdown', 'testing', 'dormant', 'up'];
+
     public function __construct(
         public readonly string $name,
         public readonly string $macAddress,
@@ -346,6 +403,29 @@ final class NetworkInterface
         public readonly int $rxBytes,
         public readonly int $txBytes
     ) {
+        if ($this->name === '') {
+            throw new InvalidArgumentException('Interface name must not be empty');
+        }
+        if ($this->mtu < 0) {
+            throw new InvalidArgumentException("Interface {$this->name} has an invalid MTU");
+        }
+        if ($this->speedMbps !== null && $this->speedMbps < 0) {
+            throw new InvalidArgumentException("Interface {$this->name} has an invalid speed");
+        }
+        if ($this->rxBytes < 0 || $this->txBytes < 0) {
+            throw new InvalidArgumentException("Interface {$this->name} has invalid byte counters");
+        }
+        if ($this->operstate !== '' && !in_array($this->operstate, self::VALID_STATES, true)) {
+            throw new InvalidArgumentException("Interface {$this->name} has an invalid operational state");
+        }
+        if ($this->macAddress !== '' && !filter_var($this->macAddress, FILTER_VALIDATE_MAC)) {
+            throw new InvalidArgumentException("Interface {$this->name} has an invalid MAC address");
+        }
+        foreach ($this->ipv4Addresses as $ip) {
+            if (!is_string($ip) || filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+                throw new InvalidArgumentException("Interface {$this->name} has an invalid IPv4 address");
+            }
+        }
     }
 
     public function toArray(): array
@@ -362,31 +442,101 @@ final class NetworkInterface
         ];
     }
 
+    public function structuralArray(): array
+    {
+        return [
+            'name' => $this->name,
+            'mac_address' => $this->macAddress,
+            'operstate' => $this->operstate,
+            'mtu' => $this->mtu,
+            'speed_mbps' => $this->speedMbps,
+            'ipv4_addresses' => $this->ipv4Addresses,
+        ];
+    }
+
     public static function fromArray(array $data): self
     {
+        $name = self::requiredString($data, 'name');
+        $macAddress = self::optionalString($data, 'mac_address');
+        $operstate = self::optionalString($data, 'operstate');
+        $mtu = self::requiredNonNegativeInt($data, 'mtu');
+        $speedMbps = self::optionalNonNegativeInt($data, 'speed_mbps');
+        $rxBytes = self::requiredNonNegativeInt($data, 'rx_bytes');
+        $txBytes = self::requiredNonNegativeInt($data, 'tx_bytes');
+
         return new self(
-            (string)($data['name'] ?? ''),
-            (string)($data['mac_address'] ?? ''),
-            (string)($data['operstate'] ?? ''),
-            (int)($data['mtu'] ?? 0),
-            isset($data['speed_mbps']) ? (is_numeric($data['speed_mbps']) ? (int)$data['speed_mbps'] : null) : null,
+            $name,
+            $macAddress,
+            $operstate,
+            $mtu,
+            $speedMbps,
             self::normalizeStringList($data['ipv4_addresses'] ?? []),
-            (int)($data['rx_bytes'] ?? 0),
-            (int)($data['tx_bytes'] ?? 0)
+            $rxBytes,
+            $txBytes
         );
+    }
+
+    private static function requiredString(array $data, string $field): string
+    {
+        if (!array_key_exists($field, $data) || !is_string($data[$field]) || trim($data[$field]) === '') {
+            throw new RuntimeException("Invalid or missing interface field: $field");
+        }
+        return trim($data[$field]);
+    }
+
+    private static function optionalString(array $data, string $field): string
+    {
+        if (!array_key_exists($field, $data)) {
+            return '';
+        }
+        if (!is_string($data[$field])) {
+            throw new RuntimeException("Invalid interface field: $field");
+        }
+        return trim($data[$field]);
+    }
+
+    private static function requiredNonNegativeInt(array $data, string $field): int
+    {
+        if (!array_key_exists($field, $data) || filter_var($data[$field], FILTER_VALIDATE_INT) === false) {
+            throw new RuntimeException("Invalid or missing interface field: $field");
+        }
+        $value = (int)$data[$field];
+        if ($value < 0) {
+            throw new RuntimeException("Interface field must be non-negative: $field");
+        }
+        return $value;
+    }
+
+    private static function optionalNonNegativeInt(array $data, string $field): ?int
+    {
+        if (!array_key_exists($field, $data) || $data[$field] === null) {
+            return null;
+        }
+        if (filter_var($data[$field], FILTER_VALIDATE_INT) === false) {
+            throw new RuntimeException("Invalid interface field: $field");
+        }
+        $value = (int)$data[$field];
+        if ($value < 0) {
+            throw new RuntimeException("Interface field must be non-negative: $field");
+        }
+        return $value;
     }
 
     private static function normalizeStringList(mixed $value): array
     {
         if (!is_array($value)) {
-            return [];
+            throw new RuntimeException('Interface IPv4 addresses must be an array');
         }
 
         $out = [];
         foreach ($value as $item) {
-            if (is_string($item) && $item !== '') {
-                $out[$item] = true;
+            if (!is_string($item) || $item === '') {
+                throw new RuntimeException('Interface IPv4 addresses must contain non-empty strings');
             }
+            if (filter_var($item, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+                throw new RuntimeException("Invalid IPv4 address in interface manifest: $item");
+            }
+            $out[$item] = true;
         }
 
         $items = array_keys($out);
@@ -413,6 +563,33 @@ final class Manifest
         public readonly array $ipAddresses,
         public readonly array $interfaces
     ) {
+        if ($this->hostname === '') {
+            throw new InvalidArgumentException('Hostname must not be empty');
+        }
+        if ($this->timestampEpoch < 0 || $this->cpuCount < 0 || $this->uptimeSeconds < 0.0) {
+            throw new InvalidArgumentException('Manifest contains invalid non-negative values');
+        }
+        if ($this->memTotalBytes < 0 || $this->memAvailableBytes < 0) {
+            throw new InvalidArgumentException('Manifest contains invalid memory values');
+        }
+        if ($this->memAvailableBytes > $this->memTotalBytes && $this->memTotalBytes > 0) {
+            throw new InvalidArgumentException('Available memory cannot exceed total memory');
+        }
+        foreach ($this->loadavg as $value) {
+            if (!is_float($value) && !is_int($value)) {
+                throw new InvalidArgumentException('Load average values must be numeric');
+            }
+        }
+        foreach ($this->ipAddresses as $ip) {
+            if (!is_string($ip) || filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+                throw new InvalidArgumentException('Manifest contains an invalid IPv4 address');
+            }
+        }
+        foreach ($this->interfaces as $interface) {
+            if (!$interface instanceof NetworkInterface) {
+                throw new InvalidArgumentException('Manifest interfaces must contain NetworkInterface objects');
+            }
+        }
     }
 
     public function toArray(): array
@@ -440,52 +617,112 @@ final class Manifest
 
     public static function fromArray(array $data): self
     {
-        $requiredFields = ['hostname', 'timestamp_epoch', 'cpu_count'];
-        foreach ($requiredFields as $field) {
-            if (!array_key_exists($field, $data)) {
-                throw new RuntimeException("Missing required field in manifest: $field");
-            }
+        $hostname = self::requiredString($data, 'hostname');
+        $fqdn = self::optionalString($data, 'fqdn');
+        $timestamp = self::optionalString($data, 'timestamp');
+        $timestampEpoch = self::requiredNonNegativeInt($data, 'timestamp_epoch');
+        $osRelease = self::optionalString($data, 'os_release');
+        $kernel = self::optionalString($data, 'kernel');
+        $arch = self::optionalString($data, 'arch');
+        $cpuCount = self::requiredNonNegativeInt($data, 'cpu_count');
+        $uptimeSeconds = self::requiredNonNegativeFloat($data, 'uptime_seconds');
+        $memTotalBytes = self::requiredNonNegativeInt($data, 'mem_total_bytes');
+        $memAvailableBytes = self::requiredNonNegativeInt($data, 'mem_available_bytes');
+        $loadavg = self::normalizeFloatList($data['loadavg'] ?? null);
+        $ipAddresses = self::normalizeStringList($data['ip_addresses'] ?? null);
+
+        $rawInterfaces = $data['interfaces'] ?? null;
+        if (!is_array($rawInterfaces)) {
+            throw new RuntimeException('Manifest interfaces must be an array');
         }
 
         $interfaces = [];
-        $rawInterfaces = $data['interfaces'] ?? [];
-        if (is_array($rawInterfaces)) {
-            foreach ($rawInterfaces as $item) {
-                if (is_array($item)) {
-                    $interfaces[] = NetworkInterface::fromArray($item);
-                }
+        $seenInterfaces = [];
+        foreach ($rawInterfaces as $item) {
+            if (!is_array($item)) {
+                throw new RuntimeException('Manifest interface entry must be an object');
             }
+            $interface = NetworkInterface::fromArray($item);
+            if (isset($seenInterfaces[$interface->name])) {
+                throw new RuntimeException("Duplicate interface in manifest: {$interface->name}");
+            }
+            $seenInterfaces[$interface->name] = true;
+            $interfaces[] = $interface;
         }
 
         return new self(
-            (string)($data['hostname'] ?? ''),
-            (string)($data['fqdn'] ?? ''),
-            (string)($data['timestamp'] ?? ''),
-            (int)($data['timestamp_epoch'] ?? 0),
-            (string)($data['os_release'] ?? ''),
-            (string)($data['kernel'] ?? ''),
-            (string)($data['arch'] ?? ''),
-            (int)($data['cpu_count'] ?? 0),
-            (float)($data['uptime_seconds'] ?? 0.0),
-            self::normalizeFloatList($data['loadavg'] ?? []),
-            (int)($data['mem_total_bytes'] ?? 0),
-            (int)($data['mem_available_bytes'] ?? 0),
-            self::normalizeStringList($data['ip_addresses'] ?? []),
+            $hostname,
+            $fqdn,
+            $timestamp,
+            $timestampEpoch,
+            $osRelease,
+            $kernel,
+            $arch,
+            $cpuCount,
+            $uptimeSeconds,
+            $loadavg,
+            $memTotalBytes,
+            $memAvailableBytes,
+            $ipAddresses,
             $interfaces
         );
+    }
+
+    private static function requiredString(array $data, string $field): string
+    {
+        if (!array_key_exists($field, $data) || !is_string($data[$field]) || trim($data[$field]) === '') {
+            throw new RuntimeException("Invalid or missing manifest field: $field");
+        }
+        return trim($data[$field]);
+    }
+
+    private static function optionalString(array $data, string $field): string
+    {
+        if (!array_key_exists($field, $data)) {
+            return '';
+        }
+        if (!is_string($data[$field])) {
+            throw new RuntimeException("Invalid manifest field: $field");
+        }
+        return trim($data[$field]);
+    }
+
+    private static function requiredNonNegativeInt(array $data, string $field): int
+    {
+        if (!array_key_exists($field, $data) || filter_var($data[$field], FILTER_VALIDATE_INT) === false) {
+            throw new RuntimeException("Invalid or missing manifest field: $field");
+        }
+        $value = (int)$data[$field];
+        if ($value < 0) {
+            throw new RuntimeException("Manifest field must be non-negative: $field");
+        }
+        return $value;
+    }
+
+    private static function requiredNonNegativeFloat(array $data, string $field): float
+    {
+        if (!array_key_exists($field, $data) || !is_numeric($data[$field])) {
+            throw new RuntimeException("Invalid or missing manifest field: $field");
+        }
+        $value = (float)$data[$field];
+        if (!is_finite($value) || $value < 0.0) {
+            throw new RuntimeException("Manifest field must be a finite non-negative number: $field");
+        }
+        return $value;
     }
 
     private static function normalizeStringList(mixed $value): array
     {
         if (!is_array($value)) {
-            return [];
+            throw new RuntimeException('Manifest IP addresses must be an array');
         }
 
         $out = [];
         foreach ($value as $item) {
-            if (is_string($item) && $item !== '') {
-                $out[$item] = true;
+            if (!is_string($item) || filter_var($item, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+                throw new RuntimeException('Manifest contains an invalid IPv4 address');
             }
+            $out[$item] = true;
         }
 
         $items = array_keys($out);
@@ -496,14 +733,19 @@ final class Manifest
     private static function normalizeFloatList(mixed $value): array
     {
         if (!is_array($value)) {
-            return [];
+            throw new RuntimeException('Manifest load average must be an array');
         }
 
         $out = [];
         foreach ($value as $item) {
-            if (is_numeric($item)) {
-                $out[] = (float)$item;
+            if (!is_numeric($item)) {
+                throw new RuntimeException('Manifest load average must contain numeric values');
             }
+            $number = (float)$item;
+            if (!is_finite($number) || $number < 0.0) {
+                throw new RuntimeException('Manifest load average contains an invalid value');
+            }
+            $out[] = $number;
         }
 
         return $out;
@@ -537,9 +779,6 @@ final class InterfaceCollector
 
             [$rxBytes, $txBytes] = self::readRxTxBytes($name);
             $speed = FileReader::readNullableInt($base . '/' . $name . '/speed');
-            if ($speed === -1) {
-                $speed = null;
-            }
 
             $interfaces[] = new NetworkInterface(
                 $name,
@@ -644,7 +883,6 @@ final class ManifestDiff
             'arch' => [$old->arch, $new->arch],
             'cpu_count' => [$old->cpuCount, $new->cpuCount],
             'mem_total_bytes' => [$old->memTotalBytes, $new->memTotalBytes],
-            'mem_available_bytes' => [$old->memAvailableBytes, $new->memAvailableBytes],
         ] as $field => [$before, $after]) {
             if ($before !== $after) {
                 $fieldChanges[] = [
@@ -657,23 +895,21 @@ final class ManifestDiff
 
         $oldIps = $old->ipAddresses;
         $newIps = $new->ipAddresses;
-
         $oldMap = self::interfaceMap($old->interfaces);
         $newMap = self::interfaceMap($new->interfaces);
 
         $addedInterfaces = array_values(array_diff(array_keys($newMap), array_keys($oldMap)));
         $removedInterfaces = array_values(array_diff(array_keys($oldMap), array_keys($newMap)));
-
         sort($addedInterfaces);
         sort($removedInterfaces);
 
         $changedInterfaces = [];
-        $common = array_intersect(array_keys($oldMap), array_keys($newMap));
+        $common = array_values(array_intersect(array_keys($oldMap), array_keys($newMap)));
         sort($common);
 
         foreach ($common as $name) {
-            $before = $oldMap[$name]->toArray();
-            $after = $newMap[$name]->toArray();
+            $before = $oldMap[$name]->structuralArray();
+            $after = $newMap[$name]->structuralArray();
 
             if ($before === $after) {
                 continue;
@@ -704,7 +940,7 @@ final class ManifestDiff
         return [
             'old_timestamp' => $old->timestamp,
             'new_timestamp' => $new->timestamp,
-            'duration_seconds' => $new->timestampEpoch - $old->timestampEpoch,
+            'duration_seconds' => max(0, $new->timestampEpoch - $old->timestampEpoch),
             'field_changes' => $fieldChanges,
             'ip_addresses' => [
                 'old' => $oldIps,
@@ -724,9 +960,13 @@ final class ManifestDiff
     {
         $map = [];
         foreach ($interfaces as $iface) {
-            if ($iface instanceof NetworkInterface) {
-                $map[$iface->name] = $iface;
+            if (!$iface instanceof NetworkInterface) {
+                throw new InvalidArgumentException('Interface collection contains an invalid value');
             }
+            if (isset($map[$iface->name])) {
+                throw new InvalidArgumentException("Duplicate interface name: {$iface->name}");
+            }
+            $map[$iface->name] = $iface;
         }
         return $map;
     }
@@ -754,11 +994,7 @@ final class Exporter
 
     private static function json(array $data): string
     {
-        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        if ($json === false) {
-            throw new RuntimeException('Failed to encode JSON');
-        }
-        return $json . PHP_EOL;
+        return json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL;
     }
 
     private static function table(Manifest $manifest, bool $colors): string
@@ -766,52 +1002,46 @@ final class Exporter
         $lines = [];
         $lines[] = ConsoleColor::wrapBold('SYSTEM MANIFEST', $colors);
         $lines[] = str_repeat('=', 72);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Hostname:', ConsoleColor::CYAN, $colors), $manifest->hostname);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('FQDN:', ConsoleColor::CYAN, $colors), $manifest->fqdn);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Timestamp:', ConsoleColor::CYAN, $colors), $manifest->timestamp);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('OS Release:', ConsoleColor::CYAN, $colors), $manifest->osRelease);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Kernel:', ConsoleColor::CYAN, $colors), $manifest->kernel);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Architecture:', ConsoleColor::CYAN, $colors), $manifest->arch);
-        $lines[] = sprintf('%-20s %d', ConsoleColor::wrap('CPU Count:', ConsoleColor::CYAN, $colors), $manifest->cpuCount);
-        $lines[] = sprintf('%-20s %.2f', ConsoleColor::wrap('Uptime Seconds:', ConsoleColor::CYAN, $colors), $manifest->uptimeSeconds);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Load Average:', ConsoleColor::CYAN, $colors), implode(', ', array_map(
+        $lines[] = self::label('Hostname:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->hostname;
+        $lines[] = self::label('FQDN:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->fqdn;
+        $lines[] = self::label('Timestamp:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->timestamp;
+        $lines[] = self::label('OS Release:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->osRelease;
+        $lines[] = self::label('Kernel:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->kernel;
+        $lines[] = self::label('Architecture:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->arch;
+        $lines[] = self::label('CPU Count:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->cpuCount;
+        $lines[] = self::label('Uptime Seconds:', 20, ConsoleColor::CYAN, $colors) . ' ' . number_format($manifest->uptimeSeconds, 2, '.', '');
+        $lines[] = self::label('Load Average:', 20, ConsoleColor::CYAN, $colors) . ' ' . implode(', ', array_map(
             static fn(float $v): string => number_format($v, 2, '.', ''),
             $manifest->loadavg
-        )));
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Memory Total:', ConsoleColor::CYAN, $colors), self::humanBytes($manifest->memTotalBytes));
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Memory Available:', ConsoleColor::CYAN, $colors), self::humanBytes($manifest->memAvailableBytes));
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('IP Addresses:', ConsoleColor::CYAN, $colors), implode(', ', $manifest->ipAddresses));
+        ));
+        $lines[] = self::label('Memory Total:', 20, ConsoleColor::CYAN, $colors) . ' ' . self::humanBytes($manifest->memTotalBytes);
+        $lines[] = self::label('Memory Available:', 20, ConsoleColor::CYAN, $colors) . ' ' . self::humanBytes($manifest->memAvailableBytes);
+        $lines[] = self::label('IP Addresses:', 20, ConsoleColor::CYAN, $colors) . ' ' . implode(', ', $manifest->ipAddresses);
         $lines[] = '';
         $lines[] = ConsoleColor::wrapBold('INTERFACES', $colors);
         $lines[] = str_repeat('-', 72);
-        $lines[] = sprintf(
-            '%-12s %-10s %-8s %-8s %-17s %-16s',
-            ConsoleColor::wrap('Name', ConsoleColor::YELLOW, $colors),
-            ConsoleColor::wrap('State', ConsoleColor::YELLOW, $colors),
-            ConsoleColor::wrap('MTU', ConsoleColor::YELLOW, $colors),
-            ConsoleColor::wrap('Speed', ConsoleColor::YELLOW, $colors),
-            ConsoleColor::wrap('RX', ConsoleColor::YELLOW, $colors),
-            ConsoleColor::wrap('TX', ConsoleColor::YELLOW, $colors)
-        );
+        $lines[] = self::cell('Name', 12, ConsoleColor::YELLOW, $colors)
+            . self::cell('State', 10, ConsoleColor::YELLOW, $colors)
+            . self::cell('MTU', 8, ConsoleColor::YELLOW, $colors)
+            . self::cell('Speed', 8, ConsoleColor::YELLOW, $colors)
+            . self::cell('RX', 17, ConsoleColor::YELLOW, $colors)
+            . self::cell('TX', 16, ConsoleColor::YELLOW, $colors);
 
         foreach ($manifest->interfaces as $iface) {
-            $stateColor = match($iface->operstate) {
+            $stateColor = match ($iface->operstate) {
                 'up' => ConsoleColor::GREEN,
                 'down' => ConsoleColor::RED,
                 default => ConsoleColor::WHITE,
             };
-            
-            $lines[] = sprintf(
-                '%-12s %-10s %-8d %-8s %-17s %-16s',
-                ConsoleColor::wrap($iface->name, ConsoleColor::MAGENTA, $colors),
-                ConsoleColor::wrap($iface->operstate, $stateColor, $colors),
-                $iface->mtu,
-                $iface->speedMbps !== null ? $iface->speedMbps . 'M' : '-',
-                self::humanBytes($iface->rxBytes),
-                self::humanBytes($iface->txBytes)
-            );
-            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', ConsoleColor::wrap('MAC:', ConsoleColor::CYAN, $colors), $iface->macAddress);
-            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', ConsoleColor::wrap('IPv4:', ConsoleColor::CYAN, $colors), implode(', ', $iface->ipv4Addresses));
+
+            $lines[] = self::cell($iface->name, 12, ConsoleColor::MAGENTA, $colors)
+                . self::cell($iface->operstate, 10, $stateColor, $colors)
+                . self::cell((string)$iface->mtu, 8, null, $colors)
+                . self::cell($iface->speedMbps !== null ? $iface->speedMbps . 'M' : '-', 8, null, $colors)
+                . self::cell(self::humanBytes($iface->rxBytes), 17, null, $colors)
+                . self::cell(self::humanBytes($iface->txBytes), 16, null, $colors);
+            $lines[] = str_repeat(' ', 38) . self::cell('MAC:', 17, ConsoleColor::CYAN, $colors) . $iface->macAddress;
+            $lines[] = str_repeat(' ', 38) . self::cell('IPv4:', 17, ConsoleColor::CYAN, $colors) . implode(', ', $iface->ipv4Addresses);
         }
 
         return implode(PHP_EOL, $lines) . PHP_EOL;
@@ -822,13 +1052,13 @@ final class Exporter
         $lines = [];
         $lines[] = ConsoleColor::wrapBold('MANIFEST DIFF', $colors);
         $lines[] = str_repeat('=', 72);
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Old Timestamp:', ConsoleColor::CYAN, $colors), (string)($diff['old_timestamp'] ?? ''));
-        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('New Timestamp:', ConsoleColor::CYAN, $colors), (string)($diff['new_timestamp'] ?? ''));
-        $lines[] = sprintf('%-20s %d', ConsoleColor::wrap('Duration Seconds:', ConsoleColor::CYAN, $colors), (int)($diff['duration_seconds'] ?? 0));
+        $lines[] = self::label('Old Timestamp:', 20, ConsoleColor::CYAN, $colors) . ' ' . (string)($diff['old_timestamp'] ?? '');
+        $lines[] = self::label('New Timestamp:', 20, ConsoleColor::CYAN, $colors) . ' ' . (string)($diff['new_timestamp'] ?? '');
+        $lines[] = self::label('Duration Seconds:', 20, ConsoleColor::CYAN, $colors) . ' ' . (int)($diff['duration_seconds'] ?? 0);
         $lines[] = '';
-
-        $lines[] = ConsoleColor::wrapBold('FIELD CHANGES', $colors);
+        $lines[] = ConsoleColor::wrapBold('STRUCTURAL FIELD CHANGES', $colors);
         $lines[] = str_repeat('-', 72);
+
         $fieldChanges = $diff['field_changes'] ?? [];
         if (is_array($fieldChanges) && $fieldChanges !== []) {
             foreach ($fieldChanges as $change) {
@@ -843,7 +1073,7 @@ final class Exporter
                 $lines[] = '  new: ' . ConsoleColor::wrap($new, ConsoleColor::GREEN, $colors);
             }
         } else {
-            $lines[] = 'No scalar field changes';
+            $lines[] = 'No structural field changes';
         }
 
         $lines[] = '';
@@ -905,6 +1135,25 @@ final class Exporter
         return implode(PHP_EOL, $lines) . PHP_EOL;
     }
 
+    private static function label(string $text, int $width, string $color, bool $colors): string
+    {
+        return ConsoleColor::wrap(str_pad($text, $width), $color, $colors);
+    }
+
+    private static function cell(string $text, int $width, ?string $color, bool $colors): string
+    {
+        $cell = str_pad(self::truncate($text, max(0, $width - 1)), $width);
+        return $color === null ? $cell : ConsoleColor::wrap($cell, $color, $colors);
+    }
+
+    private static function truncate(string $text, int $maxLength): string
+    {
+        if ($maxLength <= 0 || strlen($text) <= $maxLength) {
+            return $text;
+        }
+        return substr($text, 0, $maxLength);
+    }
+
     private static function humanBytes(int $bytes): string
     {
         $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -922,8 +1171,11 @@ final class Exporter
     private static function stringify(mixed $value): string
     {
         if (is_array($value)) {
-            $json = json_encode($value, JSON_UNESCAPED_SLASHES);
-            return $json === false ? '[array]' : $json;
+            try {
+                return json_encode($value, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            } catch (JsonException) {
+                return '[array]';
+            }
         }
 
         if ($value === null) {
@@ -1048,6 +1300,7 @@ final class Application
             if (is_string($options['output'])) {
                 JsonFile::save($options['output'], $manifest->toArray());
                 self::log("Manifest saved to {$options['output']}");
+                return 0;
             }
 
             if (is_string($options['compare'])) {
