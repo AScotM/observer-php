@@ -207,8 +207,6 @@ final class ProcessExecutor
             }
         }
 
-        stream_set_blocking($pipes[1], true);
-        stream_set_blocking($pipes[2], true);
         $remainingStdout = stream_get_contents($pipes[1]);
         $remainingStderr = stream_get_contents($pipes[2]);
         if ($remainingStdout !== false) {
@@ -243,18 +241,7 @@ final class HostInfo
 
     public static function fqdn(): string
     {
-        $hostname = self::hostname();
-        if ($hostname === '') {
-            return '';
-        }
-
-        $ip = gethostbyname($hostname);
-        $fqdn = @gethostbyaddr($ip);
-        if ($fqdn === false || $fqdn === $ip) {
-            return $hostname;
-        }
-
-        return $fqdn;
+        return self::hostname();
     }
 
     public static function osRelease(): string
@@ -1350,4 +1337,568 @@ final class Application
     }
 }
 
-exit(Application::run($_SERVER['argv']));
+final class Observatory
+{
+    private static function text(string $path): ?string
+    {
+        $value = @file_get_contents($path);
+        return $value === false ? null : trim($value);
+    }
+
+    private static function number(string $path): ?int
+    {
+        $value = self::text($path);
+        return $value !== null && preg_match('/^-?\d+$/', $value) ? (int)$value : null;
+    }
+
+    private static function keyed(string $path): array
+    {
+        $text = self::text($path);
+        $result = [];
+        if ($text === null) {
+            return $result;
+        }
+        foreach (preg_split('/\R/', $text) ?: [] as $line) {
+            if (preg_match('/^([^:\s]+):\s*(\d+)/', $line, $m)) {
+                $result[$m[1]] = (int)$m[2];
+            }
+        }
+        return $result;
+    }
+
+    private static function cpu(): array
+    {
+        $stat = self::text('/proc/stat');
+        $totals = [];
+        if ($stat !== null) {
+            foreach (preg_split('/\R/', $stat) ?: [] as $line) {
+                if (!preg_match('/^(cpu\d*)\s+(.+)$/', $line, $m)) {
+                    continue;
+                }
+                $fields = preg_split('/\s+/', trim($m[2])) ?: [];
+                $values = array_map('intval', $fields);
+                $idle = ($values[3] ?? 0) + ($values[4] ?? 0);
+                $totals[$m[1]] = ['total' => array_sum($values), 'idle' => $idle];
+            }
+        }
+        $pressure = self::pressure('/proc/pressure/cpu');
+        return ['ticks' => $totals, 'pressure' => $pressure, 'load' => HostInfo::loadAvg()];
+    }
+
+    private static function pressure(string $path): array
+    {
+        $text = self::text($path);
+        $result = [];
+        if ($text === null) {
+            return $result;
+        }
+        foreach (preg_split('/\R/', $text) ?: [] as $line) {
+            if (!preg_match('/^(some|full)\s+(.+)$/', $line, $m)) {
+                continue;
+            }
+            $values = [];
+            foreach (preg_split('/\s+/', $m[2]) ?: [] as $part) {
+                if (str_contains($part, '=')) {
+                    [$key, $value] = explode('=', $part, 2);
+                    $values[$key] = $key === 'total' ? (int)$value : (float)$value;
+                }
+            }
+            $result[$m[1]] = $values;
+        }
+        return $result;
+    }
+
+    private static function memory(): array
+    {
+        $data = HostInfo::meminfo();
+        $total = $data['MemTotal'] ?? null;
+        $available = $data['MemAvailable'] ?? null;
+        return [
+            'total_bytes' => $total,
+            'available_bytes' => $available,
+            'used_percent' => $total > 0 && $available !== null ? round(100 * ($total - $available) / $total, 3) : null,
+            'swap_total_bytes' => $data['SwapTotal'] ?? null,
+            'swap_free_bytes' => $data['SwapFree'] ?? null,
+            'pressure' => self::pressure('/proc/pressure/memory'),
+            'vmstat' => self::vmstat(),
+        ];
+    }
+
+    private static function vmstat(): array
+    {
+        $text = self::text('/proc/vmstat');
+        $wanted = ['pgfault', 'pgmajfault', 'pswpin', 'pswpout', 'oom_kill'];
+        $result = [];
+        foreach (preg_split('/\R/', $text ?? '') ?: [] as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts ?: []) === 2 && in_array($parts[0], $wanted, true)) {
+                $result[$parts[0]] = (int)$parts[1];
+            }
+        }
+        return $result;
+    }
+
+    private static function disks(): array
+    {
+        $mounts = self::text('/proc/self/mountinfo');
+        $result = [];
+        $ignored = ['proc', 'sysfs', 'devpts', 'cgroup', 'cgroup2', 'securityfs', 'pstore', 'debugfs', 'tracefs', 'configfs', 'mqueue', 'hugetlbfs', 'fusectl', 'binfmt_misc', 'autofs'];
+        foreach (preg_split('/\R/', $mounts ?? '') ?: [] as $line) {
+            $halves = explode(' - ', $line, 2);
+            if (count($halves) !== 2) {
+                continue;
+            }
+            $left = explode(' ', $halves[0]);
+            $right = explode(' ', $halves[1]);
+            $type = $right[0] ?? '';
+            if (in_array($type, $ignored, true)) {
+                continue;
+            }
+            $mount = str_replace(['\\040', '\\011', '\\012', '\\134'], [' ', "\t", "\n", '\\'], $left[4] ?? '');
+            if ($mount === '' || isset($result[$mount])) {
+                continue;
+            }
+            $total = @disk_total_space($mount);
+            $free = @disk_free_space($mount);
+            $result[$mount] = [
+                'filesystem' => $right[1] ?? '',
+                'type' => $type,
+                'total_bytes' => $total === false ? null : (int)$total,
+                'free_bytes' => $free === false ? null : (int)$free,
+                'used_percent' => $total > 0 && $free !== false ? round(100 * ($total - $free) / $total, 3) : null,
+            ];
+        }
+        ksort($result);
+        return $result;
+    }
+
+    private static function diskIo(): array
+    {
+        $text = self::text('/proc/diskstats');
+        $result = [];
+        foreach (preg_split('/\R/', $text ?? '') ?: [] as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts ?: []) < 14) {
+                continue;
+            }
+            $name = $parts[2];
+            $result[$name] = [
+                'reads' => (int)$parts[3],
+                'read_bytes' => (int)$parts[5] * 512,
+                'writes' => (int)$parts[7],
+                'write_bytes' => (int)$parts[9] * 512,
+                'io_ms' => (int)$parts[12],
+            ];
+        }
+        ksort($result);
+        return $result;
+    }
+
+    private static function network(): array
+    {
+        $result = [];
+        foreach (@scandir('/sys/class/net') ?: [] as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            $base = '/sys/class/net/' . $name;
+            $statistics = [];
+            foreach (['rx_bytes', 'tx_bytes', 'rx_packets', 'tx_packets', 'rx_errors', 'tx_errors', 'rx_dropped', 'tx_dropped'] as $key) {
+                $statistics[$key] = self::number($base . '/statistics/' . $key);
+            }
+            $result[$name] = [
+                'state' => self::text($base . '/operstate'),
+                'mac' => self::text($base . '/address'),
+                'mtu' => self::number($base . '/mtu'),
+                'speed_mbps' => ($speed = self::number($base . '/speed')) !== null && $speed >= 0 ? $speed : null,
+                'statistics' => $statistics,
+            ];
+        }
+        ksort($result);
+        return $result;
+    }
+
+    private static function security(): array
+    {
+        $selinux = self::number('/sys/fs/selinux/enforce');
+        $lockdown = self::text('/sys/kernel/security/lockdown');
+        $lsm = self::text('/sys/kernel/security/lsm');
+        return [
+            'selinux_enforcing' => $selinux === null ? null : $selinux === 1,
+            'selinux_policy' => self::text('/sys/fs/selinux/policyvers'),
+            'lockdown' => $lockdown,
+            'lsm' => $lsm === null ? null : array_map('trim', explode(',', $lsm)),
+            'unprivileged_bpf_disabled' => self::number('/proc/sys/kernel/unprivileged_bpf_disabled'),
+            'kptr_restrict' => self::number('/proc/sys/kernel/kptr_restrict'),
+            'dmesg_restrict' => self::number('/proc/sys/kernel/dmesg_restrict'),
+            'yama_ptrace_scope' => self::number('/proc/sys/kernel/yama/ptrace_scope'),
+            'randomize_va_space' => self::number('/proc/sys/kernel/randomize_va_space'),
+        ];
+    }
+
+    private static function processes(): array
+    {
+        $counts = ['total' => 0, 'running' => 0, 'sleeping' => 0, 'uninterruptible' => 0, 'zombie' => 0, 'other' => 0];
+        foreach (@scandir('/proc') ?: [] as $entry) {
+            if (!ctype_digit($entry)) {
+                continue;
+            }
+            $status = self::text('/proc/' . $entry . '/status');
+            if ($status === null || !preg_match('/^State:\s+([A-Z])/m', $status, $m)) {
+                continue;
+            }
+            $counts['total']++;
+            $key = match ($m[1]) {
+                'R' => 'running',
+                'S' => 'sleeping',
+                'D' => 'uninterruptible',
+                'Z' => 'zombie',
+                default => 'other',
+            };
+            $counts[$key]++;
+        }
+        return $counts;
+    }
+
+    public static function capture(): array
+    {
+        $manifest = ManifestBuilder::build()->toArray();
+        return [
+            'schema_version' => 2,
+            'captured_at' => gmdate('c'),
+            'captured_epoch' => microtime(true),
+            'boot_id' => self::text('/proc/sys/kernel/random/boot_id'),
+            'manifest' => $manifest,
+            'cpu' => self::cpu(),
+            'memory' => self::memory(),
+            'mounts' => self::disks(),
+            'disk_io' => self::diskIo(),
+            'network' => self::network(),
+            'security' => self::security(),
+            'processes' => self::processes(),
+            'io_pressure' => self::pressure('/proc/pressure/io'),
+        ];
+    }
+
+    public static function rates(array $old, array $new): array
+    {
+        $elapsed = ($new['captured_epoch'] ?? 0) - ($old['captured_epoch'] ?? 0);
+        if ($elapsed <= 0 || ($old['boot_id'] ?? null) !== ($new['boot_id'] ?? null)) {
+            return ['elapsed_seconds' => max(0, $elapsed), 'available' => false];
+        }
+        $result = ['elapsed_seconds' => round($elapsed, 6), 'available' => true, 'cpu' => [], 'network' => [], 'disk_io' => []];
+        foreach ($new['cpu']['ticks'] ?? [] as $name => $current) {
+            $previous = $old['cpu']['ticks'][$name] ?? null;
+            if (!is_array($previous)) {
+                continue;
+            }
+            $total = $current['total'] - $previous['total'];
+            $idle = $current['idle'] - $previous['idle'];
+            if ($total > 0 && $idle >= 0 && $idle <= $total) {
+                $result['cpu'][$name] = round(100 * ($total - $idle) / $total, 3);
+            }
+        }
+        foreach (['network' => 'statistics', 'disk_io' => null] as $section => $nested) {
+            foreach ($new[$section] ?? [] as $name => $current) {
+                $previous = $old[$section][$name] ?? null;
+                if (!is_array($previous)) {
+                    continue;
+                }
+                $currentCounters = $nested === null ? $current : ($current[$nested] ?? []);
+                $previousCounters = $nested === null ? $previous : ($previous[$nested] ?? []);
+                foreach ($currentCounters as $key => $value) {
+                    $before = $previousCounters[$key] ?? null;
+                    if (is_int($value) && is_int($before) && $value >= $before) {
+                        $result[$section][$name][$key . '_per_sec'] = round(($value - $before) / $elapsed, 3);
+                    }
+                }
+            }
+        }
+        return $result;
+    }
+
+    public static function changes(array $old, array $new): array
+    {
+        $changes = [];
+        foreach (['manifest', 'mounts', 'network', 'security'] as $section) {
+            $a = $old[$section] ?? [];
+            $b = $new[$section] ?? [];
+            if ($section === 'manifest') {
+                foreach (['timestamp', 'timestamp_epoch', 'uptime_seconds', 'loadavg', 'mem_available_bytes'] as $key) {
+                    unset($a[$key], $b[$key]);
+                }
+                foreach (['interfaces'] as $key) {
+                    if (isset($a[$key]) && is_array($a[$key])) {
+                        foreach ($a[$key] as &$iface) {
+                            unset($iface['rx_bytes'], $iface['tx_bytes']);
+                        }
+                        unset($iface);
+                    }
+                    if (isset($b[$key]) && is_array($b[$key])) {
+                        foreach ($b[$key] as &$iface) {
+                            unset($iface['rx_bytes'], $iface['tx_bytes']);
+                        }
+                        unset($iface);
+                    }
+                }
+            }
+            if ($section === 'network') {
+                foreach ($a as &$iface) {
+                    unset($iface['statistics']);
+                }
+                unset($iface);
+                foreach ($b as &$iface) {
+                    unset($iface['statistics']);
+                }
+                unset($iface);
+            }
+            if ($section === 'mounts') {
+                foreach ($a as &$mount) {
+                    unset($mount['free_bytes'], $mount['used_percent']);
+                }
+                unset($mount);
+                foreach ($b as &$mount) {
+                    unset($mount['free_bytes'], $mount['used_percent']);
+                }
+                unset($mount);
+            }
+            self::walkDiff($section, $a, $b, $changes);
+        }
+        return $changes;
+    }
+
+    private static function walkDiff(string $path, mixed $a, mixed $b, array &$changes): void
+    {
+        if (is_array($a) && is_array($b)) {
+            $keys = array_unique(array_merge(array_keys($a), array_keys($b)));
+            sort($keys);
+            foreach ($keys as $key) {
+                $existsA = array_key_exists($key, $a);
+                $existsB = array_key_exists($key, $b);
+                $next = $path . '.' . $key;
+                if (!$existsA || !$existsB) {
+                    $changes[] = ['path' => $next, 'before' => $existsA ? $a[$key] : null, 'after' => $existsB ? $b[$key] : null, 'kind' => $existsA ? 'removed' : 'added'];
+                } else {
+                    self::walkDiff($next, $a[$key], $b[$key], $changes);
+                }
+            }
+        } elseif ($a !== $b) {
+            $changes[] = ['path' => $path, 'before' => $a, 'after' => $b, 'kind' => 'changed'];
+        }
+    }
+}
+
+final class ObservatoryCli
+{
+    private static function options(array $argv): array
+    {
+        $defaults = ['format' => 'table', 'output' => null, 'compare' => null, 'watch' => false, 'interval' => 2.0, 'count' => 0, 'cpu-warn' => 85.0, 'memory-warn' => 90.0, 'disk-warn' => 90.0, 'no-color' => false, 'help' => false];
+        $flags = ['watch', 'no-color', 'help'];
+        for ($i = 1; $i < count($argv); $i++) {
+            $arg = $argv[$i];
+            if (!str_starts_with($arg, '--')) {
+                throw new InvalidArgumentException('Unexpected argument: ' . $arg);
+            }
+            $pair = explode('=', substr($arg, 2), 2);
+            $name = $pair[0];
+            if (!array_key_exists($name, $defaults)) {
+                throw new InvalidArgumentException('Unknown option: --' . $name);
+            }
+            if (in_array($name, $flags, true)) {
+                if (count($pair) > 1) {
+                    throw new InvalidArgumentException('Flag does not accept a value: --' . $name);
+                }
+                $defaults[$name] = true;
+                continue;
+            }
+            $value = $pair[1] ?? ($argv[++$i] ?? null);
+            if ($value === null || str_starts_with($value, '--')) {
+                throw new InvalidArgumentException('Missing value for --' . $name);
+            }
+            $defaults[$name] = $value;
+        }
+        if (!in_array($defaults['format'], ['table', 'json', 'jsonl'], true)) {
+            throw new InvalidArgumentException('Format must be table, json, or jsonl');
+        }
+        foreach (['interval', 'cpu-warn', 'memory-warn', 'disk-warn'] as $name) {
+            if (!is_numeric($defaults[$name])) {
+                throw new InvalidArgumentException('Invalid numeric value for --' . $name);
+            }
+            $defaults[$name] = (float)$defaults[$name];
+            if (!is_finite($defaults[$name]) || $defaults[$name] < 0) {
+                throw new InvalidArgumentException('Invalid range for --' . $name);
+            }
+        }
+        if ($defaults['interval'] < 0.1) {
+            throw new InvalidArgumentException('Interval must be at least 0.1 seconds');
+        }
+        if (filter_var($defaults['count'], FILTER_VALIDATE_INT) === false || (int)$defaults['count'] < 0) {
+            throw new InvalidArgumentException('Count must be a nonnegative integer');
+        }
+        $defaults['count'] = (int)$defaults['count'];
+        if ($defaults['compare'] !== null && $defaults['watch']) {
+            throw new InvalidArgumentException('Compare and watch are mutually exclusive');
+        }
+        return $defaults;
+    }
+
+    private static function encode(array $data, bool $pretty): string
+    {
+        return json_encode($data, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | ($pretty ? JSON_PRETTY_PRINT : 0)) . PHP_EOL;
+    }
+
+    private static function output(string $text, ?string $path, bool $append = false): void
+    {
+        if ($path === null || $path === '-') {
+            echo $text;
+            return;
+        }
+        $directory = dirname($path);
+        if (!is_dir($directory) && !@mkdir($directory, 0755, true) && !is_dir($directory)) {
+            throw new RuntimeException('Cannot create directory: ' . $directory);
+        }
+        if ($append) {
+            if (@file_put_contents($path, $text, FILE_APPEND | LOCK_EX) === false) {
+                throw new RuntimeException('Cannot append to: ' . $path);
+            }
+        } else {
+            $tmp = $path . '.tmp.' . bin2hex(random_bytes(6));
+            try {
+                if (@file_put_contents($tmp, $text, LOCK_EX) === false || !@rename($tmp, $path)) {
+                    throw new RuntimeException('Cannot write: ' . $path);
+                }
+            } finally {
+                @unlink($tmp);
+            }
+        }
+    }
+
+    private static function alerts(array $snapshot, ?array $rates, array $options): array
+    {
+        $alerts = [];
+        $cpu = $rates['cpu']['cpu'] ?? null;
+        if ($cpu !== null && $cpu >= $options['cpu-warn']) {
+            $alerts[] = ['metric' => 'cpu_percent', 'value' => $cpu, 'threshold' => $options['cpu-warn']];
+        }
+        $memory = $snapshot['memory']['used_percent'] ?? null;
+        if ($memory !== null && $memory >= $options['memory-warn']) {
+            $alerts[] = ['metric' => 'memory_used_percent', 'value' => $memory, 'threshold' => $options['memory-warn']];
+        }
+        foreach ($snapshot['mounts'] as $path => $mount) {
+            $used = $mount['used_percent'];
+            if ($used !== null && $used >= $options['disk-warn']) {
+                $alerts[] = ['metric' => 'disk_used_percent', 'mount' => $path, 'value' => $used, 'threshold' => $options['disk-warn']];
+            }
+        }
+        return $alerts;
+    }
+
+    private static function table(array $report): string
+    {
+        $snapshot = $report['snapshot'];
+        $manifest = $snapshot['manifest'];
+        $lines = [
+            'OBSERVER PHP 2.0.0',
+            str_repeat('=', 76),
+            sprintf('Host: %-28s OS: %s', $manifest['hostname'], $manifest['os_release']),
+            sprintf('Kernel: %-26s Captured: %s', $manifest['kernel'], $snapshot['captured_at']),
+            sprintf('CPU: %d cores   Load: %s   Uptime: %.0f s', $manifest['cpu_count'], implode(' / ', $manifest['loadavg']), $manifest['uptime_seconds']),
+            sprintf('Memory used: %s%%   Processes: %d   Zombies: %d', $snapshot['memory']['used_percent'] ?? 'n/a', $snapshot['processes']['total'], $snapshot['processes']['zombie']),
+            sprintf('SELinux enforcing: %s', ($snapshot['security']['selinux_enforcing'] ?? null) === null ? 'unavailable' : ($snapshot['security']['selinux_enforcing'] ? 'yes' : 'no')),
+            '',
+            'NETWORK INTERFACES',
+            str_repeat('-', 76),
+            sprintf('%-17s %-12s %10s %14s %14s', 'Name', 'State', 'MTU', 'RX bytes', 'TX bytes'),
+        ];
+        foreach ($snapshot['network'] as $name => $iface) {
+            $s = $iface['statistics'];
+            $lines[] = sprintf('%-17.17s %-12.12s %10s %14s %14s', $name, $iface['state'] ?? '-', $iface['mtu'] ?? '-', $s['rx_bytes'] ?? '-', $s['tx_bytes'] ?? '-');
+        }
+        $lines[] = '';
+        $lines[] = 'MOUNTS';
+        $lines[] = str_repeat('-', 76);
+        foreach ($snapshot['mounts'] as $path => $mount) {
+            $lines[] = sprintf('%-42.42s %-12.12s %8s%%', $path, $mount['type'], $mount['used_percent'] ?? 'n/a');
+        }
+        if (isset($report['rates'])) {
+            $rates = $report['rates'];
+            $lines[] = '';
+            $lines[] = 'INTERVAL RATES';
+            $lines[] = str_repeat('-', 76);
+            $lines[] = sprintf('Elapsed: %.3f s   CPU busy: %s%%', $rates['elapsed_seconds'], $rates['cpu']['cpu'] ?? 'n/a');
+            foreach ($rates['network'] ?? [] as $name => $values) {
+                $lines[] = sprintf('%-17s RX %12s B/s   TX %12s B/s', $name, $values['rx_bytes_per_sec'] ?? '-', $values['tx_bytes_per_sec'] ?? '-');
+            }
+        }
+        if (isset($report['changes'])) {
+            $lines[] = '';
+            $lines[] = 'STRUCTURAL CHANGES: ' . count($report['changes']);
+            foreach ($report['changes'] as $change) {
+                $lines[] = sprintf('%s %s', strtoupper($change['kind']), $change['path']);
+            }
+        }
+        if (!empty($report['alerts'])) {
+            $lines[] = '';
+            $lines[] = 'THRESHOLD ALERTS';
+            foreach ($report['alerts'] as $alert) {
+                $lines[] = sprintf('%s %s >= %s', $alert['metric'] . (isset($alert['mount']) ? ' ' . $alert['mount'] : ''), $alert['value'], $alert['threshold']);
+            }
+        }
+        return implode(PHP_EOL, $lines) . PHP_EOL;
+    }
+
+    public static function run(array $argv): int
+    {
+        try {
+            if (PHP_SAPI !== 'cli' || PHP_OS_FAMILY !== 'Linux' || PHP_VERSION_ID < 80200) {
+                throw new RuntimeException('Linux CLI and PHP 8.2+ are required');
+            }
+            $options = self::options($argv);
+            if ($options['help']) {
+                echo "Observer PHP 2.0.0\n\n";
+                echo "Usage: php main.php [--format table|json|jsonl] [--output PATH] [--compare PATH]\n";
+                echo "       php main.php --watch [--interval SECONDS] [--count N] [--format table|jsonl]\n";
+                echo "Options: --cpu-warn PERCENT --memory-warn PERCENT --disk-warn PERCENT --no-color --help\n";
+                return 0;
+            }
+            if ($options['watch'] && $options['format'] === 'json') {
+                throw new InvalidArgumentException('Use jsonl or table for continuous monitoring');
+            }
+            $previous = null;
+            if ($options['compare'] !== null) {
+                $previous = JsonFile::load($options['compare']);
+                if (($previous['schema_version'] ?? null) !== 2) {
+                    throw new RuntimeException('Comparison requires a version 2 snapshot');
+                }
+            }
+            $iteration = 0;
+            do {
+                $snapshot = Observatory::capture();
+                $report = ['snapshot' => $snapshot];
+                if ($previous !== null) {
+                    $report['changes'] = Observatory::changes($previous, $snapshot);
+                    $report['rates'] = Observatory::rates($previous, $snapshot);
+                }
+                $report['alerts'] = self::alerts($snapshot, $report['rates'] ?? null, $options);
+                if (!$options['watch'] && $options['compare'] === null && $options['output'] !== null) {
+                    self::output(self::encode($snapshot, true), $options['output']);
+                } else {
+                    $text = $options['format'] === 'table' ? self::table($report) : self::encode($report, $options['format'] === 'json');
+                    self::output($text, $options['output'], $options['watch']);
+                }
+                $previous = $snapshot;
+                $iteration++;
+                if (!$options['watch'] || ($options['count'] > 0 && $iteration >= $options['count'])) {
+                    break;
+                }
+                usleep((int)round($options['interval'] * 1000000));
+            } while (true);
+            return 0;
+        } catch (Throwable $error) {
+            fwrite(STDERR, 'error: ' . $error->getMessage() . PHP_EOL);
+            return 1;
+        }
+    }
+}
+
+exit(ObservatoryCli::run($_SERVER['argv']));
