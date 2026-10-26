@@ -59,41 +59,26 @@ final class JsonFile
 
     public static function save(string $path, array $data): void
     {
-        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        $directory = dirname($path);
+        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($json === false) {
+            throw new RuntimeException('Failed to encode JSON');
+        }
 
+        $directory = dirname($path);
         if ($directory !== '' && $directory !== '.' && !is_dir($directory)) {
             if (!@mkdir($directory, 0755, true) && !is_dir($directory)) {
                 throw new RuntimeException("Failed to create directory: $directory");
             }
         }
 
-        $existingMode = null;
-        if (file_exists($path)) {
-            $perms = @fileperms($path);
-            if ($perms !== false) {
-                $existingMode = $perms & 0777;
-            }
+        $tmp = $path . '.tmp.' . getmypid();
+        if (@file_put_contents($tmp, $json . PHP_EOL, LOCK_EX) === false) {
+            throw new RuntimeException("Failed to write temporary file: $tmp");
         }
 
-        $tmp = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
-
-        try {
-            if (@file_put_contents($tmp, $json . PHP_EOL, LOCK_EX) === false) {
-                throw new RuntimeException("Failed to write temporary file: $tmp");
-            }
-
-            if ($existingMode !== null && !@chmod($tmp, $existingMode)) {
-                throw new RuntimeException("Failed to preserve file permissions for: $path");
-            }
-
-            if (!@rename($tmp, $path)) {
-                throw new RuntimeException("Failed to move temporary file into place: $path");
-            }
-        } finally {
-            if (file_exists($tmp)) {
-                @unlink($tmp);
-            }
+        if (!@rename($tmp, $path)) {
+            @unlink($tmp);
+            throw new RuntimeException("Failed to move temporary file into place: $path");
         }
     }
 }
@@ -132,10 +117,6 @@ final class ProcessExecutor
 {
     public static function execute(string $command, int $timeoutSeconds = 5): array
     {
-        if ($timeoutSeconds <= 0) {
-            throw new InvalidArgumentException('Timeout must be positive');
-        }
-
         $descriptors = [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
@@ -147,88 +128,54 @@ final class ProcessExecutor
             return ['output' => [], 'code' => -1, 'errors' => ''];
         }
 
-        fclose($pipes[0]);
         stream_set_blocking($pipes[1], false);
         stream_set_blocking($pipes[2], false);
 
-        $stdout = '';
-        $stderr = '';
-        $startTime = hrtime(true);
-        $timeoutNanoseconds = $timeoutSeconds * 1_000_000_000;
-        $timedOut = false;
-        $exitCode = null;
+        $output = [];
+        $errors = '';
+        $startTime = microtime(true);
 
         while (true) {
-            $read = [];
-            if (!feof($pipes[1])) {
-                $read[] = $pipes[1];
-            }
-            if (!feof($pipes[2])) {
-                $read[] = $pipes[2];
+            $read = [$pipes[1], $pipes[2]];
+            $write = null;
+            $except = null;
+
+            if (stream_select($read, $write, $except, 0, 200000) === false) {
+                break;
             }
 
-            if ($read !== []) {
-                $write = null;
-                $except = null;
-                $selected = @stream_select($read, $write, $except, 0, 200000);
-                if ($selected === false) {
-                    break;
+            foreach ($read as $stream) {
+                $chunk = fread($stream, 8192);
+                if ($chunk === false || $chunk === '') {
+                    continue;
                 }
-
-                foreach ($read as $stream) {
-                    $chunk = fread($stream, 8192);
-                    if ($chunk === false || $chunk === '') {
-                        continue;
-                    }
-
-                    if ($stream === $pipes[1]) {
-                        $stdout .= $chunk;
-                    } else {
-                        $stderr .= $chunk;
-                    }
+                if ($stream === $pipes[1]) {
+                    $output[] = $chunk;
+                } else {
+                    $errors .= $chunk;
                 }
             }
 
             $status = proc_get_status($process);
             if (!$status['running']) {
-                $exitCode = is_int($status['exitcode']) && $status['exitcode'] >= 0 ? $status['exitcode'] : null;
                 break;
             }
 
-            if ((hrtime(true) - $startTime) > $timeoutNanoseconds) {
-                $timedOut = true;
-                @proc_terminate($process, 15);
-                usleep(100000);
-                $status = proc_get_status($process);
-                if ($status['running']) {
-                    @proc_terminate($process, 9);
-                }
+            if ((microtime(true) - $startTime) > $timeoutSeconds) {
+                proc_terminate($process, 9);
                 break;
             }
         }
 
-        $remainingStdout = stream_get_contents($pipes[1]);
-        $remainingStderr = stream_get_contents($pipes[2]);
-        if ($remainingStdout !== false) {
-            $stdout .= $remainingStdout;
-        }
-        if ($remainingStderr !== false) {
-            $stderr .= $remainingStderr;
+        foreach ($pipes as $pipe) {
+            fclose($pipe);
         }
 
-        fclose($pipes[1]);
-        fclose($pipes[2]);
+        $code = proc_close($process);
+        $fullOutput = explode("\n", trim(implode('', $output)));
+        $fullOutput = array_filter($fullOutput, fn($line) => $line !== '');
 
-        $closedCode = proc_close($process);
-        $code = $timedOut ? 124 : ($exitCode ?? $closedCode);
-        $lines = preg_split('/\R/', trim($stdout));
-        if ($lines === false || $stdout === '') {
-            $lines = [];
-        }
-
-        $lines = array_values(array_filter($lines, static fn(string $line): bool => $line !== ''));
-
-        return ['output' => $lines, 'code' => $code, 'errors' => trim($stderr)];
+        return ['output' => array_values($fullOutput), 'code' => $code, 'errors' => $errors];
     }
 }
 
@@ -241,7 +188,18 @@ final class HostInfo
 
     public static function fqdn(): string
     {
-        return self::hostname();
+        $hostname = self::hostname();
+        if ($hostname === '') {
+            return '';
+        }
+
+        $ip = gethostbyname($hostname);
+        $fqdn = @gethostbyaddr($ip);
+        if ($fqdn === false || $fqdn === $ip) {
+            return $hostname;
+        }
+
+        return $fqdn;
     }
 
     public static function osRelease(): string
@@ -378,8 +336,6 @@ final class HostInfo
 
 final class NetworkInterface
 {
-    private const VALID_STATES = ['unknown', 'notpresent', 'down', 'lowerlayerdown', 'testing', 'dormant', 'up'];
-
     public function __construct(
         public readonly string $name,
         public readonly string $macAddress,
@@ -390,29 +346,6 @@ final class NetworkInterface
         public readonly int $rxBytes,
         public readonly int $txBytes
     ) {
-        if ($this->name === '') {
-            throw new InvalidArgumentException('Interface name must not be empty');
-        }
-        if ($this->mtu < 0) {
-            throw new InvalidArgumentException("Interface {$this->name} has an invalid MTU");
-        }
-        if ($this->speedMbps !== null && $this->speedMbps < 0) {
-            throw new InvalidArgumentException("Interface {$this->name} has an invalid speed");
-        }
-        if ($this->rxBytes < 0 || $this->txBytes < 0) {
-            throw new InvalidArgumentException("Interface {$this->name} has invalid byte counters");
-        }
-        if ($this->operstate !== '' && !in_array($this->operstate, self::VALID_STATES, true)) {
-            throw new InvalidArgumentException("Interface {$this->name} has an invalid operational state");
-        }
-        if ($this->macAddress !== '' && !filter_var($this->macAddress, FILTER_VALIDATE_MAC)) {
-            throw new InvalidArgumentException("Interface {$this->name} has an invalid MAC address");
-        }
-        foreach ($this->ipv4Addresses as $ip) {
-            if (!is_string($ip) || filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
-                throw new InvalidArgumentException("Interface {$this->name} has an invalid IPv4 address");
-            }
-        }
     }
 
     public function toArray(): array
@@ -429,101 +362,31 @@ final class NetworkInterface
         ];
     }
 
-    public function structuralArray(): array
-    {
-        return [
-            'name' => $this->name,
-            'mac_address' => $this->macAddress,
-            'operstate' => $this->operstate,
-            'mtu' => $this->mtu,
-            'speed_mbps' => $this->speedMbps,
-            'ipv4_addresses' => $this->ipv4Addresses,
-        ];
-    }
-
     public static function fromArray(array $data): self
     {
-        $name = self::requiredString($data, 'name');
-        $macAddress = self::optionalString($data, 'mac_address');
-        $operstate = self::optionalString($data, 'operstate');
-        $mtu = self::requiredNonNegativeInt($data, 'mtu');
-        $speedMbps = self::optionalNonNegativeInt($data, 'speed_mbps');
-        $rxBytes = self::requiredNonNegativeInt($data, 'rx_bytes');
-        $txBytes = self::requiredNonNegativeInt($data, 'tx_bytes');
-
         return new self(
-            $name,
-            $macAddress,
-            $operstate,
-            $mtu,
-            $speedMbps,
+            (string)($data['name'] ?? ''),
+            (string)($data['mac_address'] ?? ''),
+            (string)($data['operstate'] ?? ''),
+            (int)($data['mtu'] ?? 0),
+            isset($data['speed_mbps']) ? (is_numeric($data['speed_mbps']) ? (int)$data['speed_mbps'] : null) : null,
             self::normalizeStringList($data['ipv4_addresses'] ?? []),
-            $rxBytes,
-            $txBytes
+            (int)($data['rx_bytes'] ?? 0),
+            (int)($data['tx_bytes'] ?? 0)
         );
-    }
-
-    private static function requiredString(array $data, string $field): string
-    {
-        if (!array_key_exists($field, $data) || !is_string($data[$field]) || trim($data[$field]) === '') {
-            throw new RuntimeException("Invalid or missing interface field: $field");
-        }
-        return trim($data[$field]);
-    }
-
-    private static function optionalString(array $data, string $field): string
-    {
-        if (!array_key_exists($field, $data)) {
-            return '';
-        }
-        if (!is_string($data[$field])) {
-            throw new RuntimeException("Invalid interface field: $field");
-        }
-        return trim($data[$field]);
-    }
-
-    private static function requiredNonNegativeInt(array $data, string $field): int
-    {
-        if (!array_key_exists($field, $data) || filter_var($data[$field], FILTER_VALIDATE_INT) === false) {
-            throw new RuntimeException("Invalid or missing interface field: $field");
-        }
-        $value = (int)$data[$field];
-        if ($value < 0) {
-            throw new RuntimeException("Interface field must be non-negative: $field");
-        }
-        return $value;
-    }
-
-    private static function optionalNonNegativeInt(array $data, string $field): ?int
-    {
-        if (!array_key_exists($field, $data) || $data[$field] === null) {
-            return null;
-        }
-        if (filter_var($data[$field], FILTER_VALIDATE_INT) === false) {
-            throw new RuntimeException("Invalid interface field: $field");
-        }
-        $value = (int)$data[$field];
-        if ($value < 0) {
-            throw new RuntimeException("Interface field must be non-negative: $field");
-        }
-        return $value;
     }
 
     private static function normalizeStringList(mixed $value): array
     {
         if (!is_array($value)) {
-            throw new RuntimeException('Interface IPv4 addresses must be an array');
+            return [];
         }
 
         $out = [];
         foreach ($value as $item) {
-            if (!is_string($item) || $item === '') {
-                throw new RuntimeException('Interface IPv4 addresses must contain non-empty strings');
+            if (is_string($item) && $item !== '') {
+                $out[$item] = true;
             }
-            if (filter_var($item, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
-                throw new RuntimeException("Invalid IPv4 address in interface manifest: $item");
-            }
-            $out[$item] = true;
         }
 
         $items = array_keys($out);
@@ -550,33 +413,6 @@ final class Manifest
         public readonly array $ipAddresses,
         public readonly array $interfaces
     ) {
-        if ($this->hostname === '') {
-            throw new InvalidArgumentException('Hostname must not be empty');
-        }
-        if ($this->timestampEpoch < 0 || $this->cpuCount < 0 || $this->uptimeSeconds < 0.0) {
-            throw new InvalidArgumentException('Manifest contains invalid non-negative values');
-        }
-        if ($this->memTotalBytes < 0 || $this->memAvailableBytes < 0) {
-            throw new InvalidArgumentException('Manifest contains invalid memory values');
-        }
-        if ($this->memAvailableBytes > $this->memTotalBytes && $this->memTotalBytes > 0) {
-            throw new InvalidArgumentException('Available memory cannot exceed total memory');
-        }
-        foreach ($this->loadavg as $value) {
-            if (!is_float($value) && !is_int($value)) {
-                throw new InvalidArgumentException('Load average values must be numeric');
-            }
-        }
-        foreach ($this->ipAddresses as $ip) {
-            if (!is_string($ip) || filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
-                throw new InvalidArgumentException('Manifest contains an invalid IPv4 address');
-            }
-        }
-        foreach ($this->interfaces as $interface) {
-            if (!$interface instanceof NetworkInterface) {
-                throw new InvalidArgumentException('Manifest interfaces must contain NetworkInterface objects');
-            }
-        }
     }
 
     public function toArray(): array
@@ -604,112 +440,52 @@ final class Manifest
 
     public static function fromArray(array $data): self
     {
-        $hostname = self::requiredString($data, 'hostname');
-        $fqdn = self::optionalString($data, 'fqdn');
-        $timestamp = self::optionalString($data, 'timestamp');
-        $timestampEpoch = self::requiredNonNegativeInt($data, 'timestamp_epoch');
-        $osRelease = self::optionalString($data, 'os_release');
-        $kernel = self::optionalString($data, 'kernel');
-        $arch = self::optionalString($data, 'arch');
-        $cpuCount = self::requiredNonNegativeInt($data, 'cpu_count');
-        $uptimeSeconds = self::requiredNonNegativeFloat($data, 'uptime_seconds');
-        $memTotalBytes = self::requiredNonNegativeInt($data, 'mem_total_bytes');
-        $memAvailableBytes = self::requiredNonNegativeInt($data, 'mem_available_bytes');
-        $loadavg = self::normalizeFloatList($data['loadavg'] ?? null);
-        $ipAddresses = self::normalizeStringList($data['ip_addresses'] ?? null);
-
-        $rawInterfaces = $data['interfaces'] ?? null;
-        if (!is_array($rawInterfaces)) {
-            throw new RuntimeException('Manifest interfaces must be an array');
+        $requiredFields = ['hostname', 'timestamp_epoch', 'cpu_count'];
+        foreach ($requiredFields as $field) {
+            if (!array_key_exists($field, $data)) {
+                throw new RuntimeException("Missing required field in manifest: $field");
+            }
         }
 
         $interfaces = [];
-        $seenInterfaces = [];
-        foreach ($rawInterfaces as $item) {
-            if (!is_array($item)) {
-                throw new RuntimeException('Manifest interface entry must be an object');
+        $rawInterfaces = $data['interfaces'] ?? [];
+        if (is_array($rawInterfaces)) {
+            foreach ($rawInterfaces as $item) {
+                if (is_array($item)) {
+                    $interfaces[] = NetworkInterface::fromArray($item);
+                }
             }
-            $interface = NetworkInterface::fromArray($item);
-            if (isset($seenInterfaces[$interface->name])) {
-                throw new RuntimeException("Duplicate interface in manifest: {$interface->name}");
-            }
-            $seenInterfaces[$interface->name] = true;
-            $interfaces[] = $interface;
         }
 
         return new self(
-            $hostname,
-            $fqdn,
-            $timestamp,
-            $timestampEpoch,
-            $osRelease,
-            $kernel,
-            $arch,
-            $cpuCount,
-            $uptimeSeconds,
-            $loadavg,
-            $memTotalBytes,
-            $memAvailableBytes,
-            $ipAddresses,
+            (string)($data['hostname'] ?? ''),
+            (string)($data['fqdn'] ?? ''),
+            (string)($data['timestamp'] ?? ''),
+            (int)($data['timestamp_epoch'] ?? 0),
+            (string)($data['os_release'] ?? ''),
+            (string)($data['kernel'] ?? ''),
+            (string)($data['arch'] ?? ''),
+            (int)($data['cpu_count'] ?? 0),
+            (float)($data['uptime_seconds'] ?? 0.0),
+            self::normalizeFloatList($data['loadavg'] ?? []),
+            (int)($data['mem_total_bytes'] ?? 0),
+            (int)($data['mem_available_bytes'] ?? 0),
+            self::normalizeStringList($data['ip_addresses'] ?? []),
             $interfaces
         );
-    }
-
-    private static function requiredString(array $data, string $field): string
-    {
-        if (!array_key_exists($field, $data) || !is_string($data[$field]) || trim($data[$field]) === '') {
-            throw new RuntimeException("Invalid or missing manifest field: $field");
-        }
-        return trim($data[$field]);
-    }
-
-    private static function optionalString(array $data, string $field): string
-    {
-        if (!array_key_exists($field, $data)) {
-            return '';
-        }
-        if (!is_string($data[$field])) {
-            throw new RuntimeException("Invalid manifest field: $field");
-        }
-        return trim($data[$field]);
-    }
-
-    private static function requiredNonNegativeInt(array $data, string $field): int
-    {
-        if (!array_key_exists($field, $data) || filter_var($data[$field], FILTER_VALIDATE_INT) === false) {
-            throw new RuntimeException("Invalid or missing manifest field: $field");
-        }
-        $value = (int)$data[$field];
-        if ($value < 0) {
-            throw new RuntimeException("Manifest field must be non-negative: $field");
-        }
-        return $value;
-    }
-
-    private static function requiredNonNegativeFloat(array $data, string $field): float
-    {
-        if (!array_key_exists($field, $data) || !is_numeric($data[$field])) {
-            throw new RuntimeException("Invalid or missing manifest field: $field");
-        }
-        $value = (float)$data[$field];
-        if (!is_finite($value) || $value < 0.0) {
-            throw new RuntimeException("Manifest field must be a finite non-negative number: $field");
-        }
-        return $value;
     }
 
     private static function normalizeStringList(mixed $value): array
     {
         if (!is_array($value)) {
-            throw new RuntimeException('Manifest IP addresses must be an array');
+            return [];
         }
 
         $out = [];
         foreach ($value as $item) {
-            if (!is_string($item) || filter_var($item, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
-                throw new RuntimeException('Manifest contains an invalid IPv4 address');
+            if (is_string($item) && $item !== '') {
+                $out[$item] = true;
             }
-            $out[$item] = true;
         }
 
         $items = array_keys($out);
@@ -720,19 +496,14 @@ final class Manifest
     private static function normalizeFloatList(mixed $value): array
     {
         if (!is_array($value)) {
-            throw new RuntimeException('Manifest load average must be an array');
+            return [];
         }
 
         $out = [];
         foreach ($value as $item) {
-            if (!is_numeric($item)) {
-                throw new RuntimeException('Manifest load average must contain numeric values');
+            if (is_numeric($item)) {
+                $out[] = (float)$item;
             }
-            $number = (float)$item;
-            if (!is_finite($number) || $number < 0.0) {
-                throw new RuntimeException('Manifest load average contains an invalid value');
-            }
-            $out[] = $number;
         }
 
         return $out;
@@ -766,6 +537,9 @@ final class InterfaceCollector
 
             [$rxBytes, $txBytes] = self::readRxTxBytes($name);
             $speed = FileReader::readNullableInt($base . '/' . $name . '/speed');
+            if ($speed === -1) {
+                $speed = null;
+            }
 
             $interfaces[] = new NetworkInterface(
                 $name,
@@ -870,6 +644,7 @@ final class ManifestDiff
             'arch' => [$old->arch, $new->arch],
             'cpu_count' => [$old->cpuCount, $new->cpuCount],
             'mem_total_bytes' => [$old->memTotalBytes, $new->memTotalBytes],
+            'mem_available_bytes' => [$old->memAvailableBytes, $new->memAvailableBytes],
         ] as $field => [$before, $after]) {
             if ($before !== $after) {
                 $fieldChanges[] = [
@@ -882,21 +657,23 @@ final class ManifestDiff
 
         $oldIps = $old->ipAddresses;
         $newIps = $new->ipAddresses;
+
         $oldMap = self::interfaceMap($old->interfaces);
         $newMap = self::interfaceMap($new->interfaces);
 
         $addedInterfaces = array_values(array_diff(array_keys($newMap), array_keys($oldMap)));
         $removedInterfaces = array_values(array_diff(array_keys($oldMap), array_keys($newMap)));
+
         sort($addedInterfaces);
         sort($removedInterfaces);
 
         $changedInterfaces = [];
-        $common = array_values(array_intersect(array_keys($oldMap), array_keys($newMap)));
+        $common = array_intersect(array_keys($oldMap), array_keys($newMap));
         sort($common);
 
         foreach ($common as $name) {
-            $before = $oldMap[$name]->structuralArray();
-            $after = $newMap[$name]->structuralArray();
+            $before = $oldMap[$name]->toArray();
+            $after = $newMap[$name]->toArray();
 
             if ($before === $after) {
                 continue;
@@ -927,7 +704,7 @@ final class ManifestDiff
         return [
             'old_timestamp' => $old->timestamp,
             'new_timestamp' => $new->timestamp,
-            'duration_seconds' => max(0, $new->timestampEpoch - $old->timestampEpoch),
+            'duration_seconds' => $new->timestampEpoch - $old->timestampEpoch,
             'field_changes' => $fieldChanges,
             'ip_addresses' => [
                 'old' => $oldIps,
@@ -947,13 +724,9 @@ final class ManifestDiff
     {
         $map = [];
         foreach ($interfaces as $iface) {
-            if (!$iface instanceof NetworkInterface) {
-                throw new InvalidArgumentException('Interface collection contains an invalid value');
+            if ($iface instanceof NetworkInterface) {
+                $map[$iface->name] = $iface;
             }
-            if (isset($map[$iface->name])) {
-                throw new InvalidArgumentException("Duplicate interface name: {$iface->name}");
-            }
-            $map[$iface->name] = $iface;
         }
         return $map;
     }
@@ -981,7 +754,11 @@ final class Exporter
 
     private static function json(array $data): string
     {
-        return json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL;
+        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($json === false) {
+            throw new RuntimeException('Failed to encode JSON');
+        }
+        return $json . PHP_EOL;
     }
 
     private static function table(Manifest $manifest, bool $colors): string
@@ -989,46 +766,52 @@ final class Exporter
         $lines = [];
         $lines[] = ConsoleColor::wrapBold('SYSTEM MANIFEST', $colors);
         $lines[] = str_repeat('=', 72);
-        $lines[] = self::label('Hostname:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->hostname;
-        $lines[] = self::label('FQDN:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->fqdn;
-        $lines[] = self::label('Timestamp:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->timestamp;
-        $lines[] = self::label('OS Release:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->osRelease;
-        $lines[] = self::label('Kernel:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->kernel;
-        $lines[] = self::label('Architecture:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->arch;
-        $lines[] = self::label('CPU Count:', 20, ConsoleColor::CYAN, $colors) . ' ' . $manifest->cpuCount;
-        $lines[] = self::label('Uptime Seconds:', 20, ConsoleColor::CYAN, $colors) . ' ' . number_format($manifest->uptimeSeconds, 2, '.', '');
-        $lines[] = self::label('Load Average:', 20, ConsoleColor::CYAN, $colors) . ' ' . implode(', ', array_map(
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Hostname:', ConsoleColor::CYAN, $colors), $manifest->hostname);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('FQDN:', ConsoleColor::CYAN, $colors), $manifest->fqdn);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Timestamp:', ConsoleColor::CYAN, $colors), $manifest->timestamp);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('OS Release:', ConsoleColor::CYAN, $colors), $manifest->osRelease);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Kernel:', ConsoleColor::CYAN, $colors), $manifest->kernel);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Architecture:', ConsoleColor::CYAN, $colors), $manifest->arch);
+        $lines[] = sprintf('%-20s %d', ConsoleColor::wrap('CPU Count:', ConsoleColor::CYAN, $colors), $manifest->cpuCount);
+        $lines[] = sprintf('%-20s %.2f', ConsoleColor::wrap('Uptime Seconds:', ConsoleColor::CYAN, $colors), $manifest->uptimeSeconds);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Load Average:', ConsoleColor::CYAN, $colors), implode(', ', array_map(
             static fn(float $v): string => number_format($v, 2, '.', ''),
             $manifest->loadavg
-        ));
-        $lines[] = self::label('Memory Total:', 20, ConsoleColor::CYAN, $colors) . ' ' . self::humanBytes($manifest->memTotalBytes);
-        $lines[] = self::label('Memory Available:', 20, ConsoleColor::CYAN, $colors) . ' ' . self::humanBytes($manifest->memAvailableBytes);
-        $lines[] = self::label('IP Addresses:', 20, ConsoleColor::CYAN, $colors) . ' ' . implode(', ', $manifest->ipAddresses);
+        )));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Memory Total:', ConsoleColor::CYAN, $colors), self::humanBytes($manifest->memTotalBytes));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Memory Available:', ConsoleColor::CYAN, $colors), self::humanBytes($manifest->memAvailableBytes));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('IP Addresses:', ConsoleColor::CYAN, $colors), implode(', ', $manifest->ipAddresses));
         $lines[] = '';
         $lines[] = ConsoleColor::wrapBold('INTERFACES', $colors);
         $lines[] = str_repeat('-', 72);
-        $lines[] = self::cell('Name', 12, ConsoleColor::YELLOW, $colors)
-            . self::cell('State', 10, ConsoleColor::YELLOW, $colors)
-            . self::cell('MTU', 8, ConsoleColor::YELLOW, $colors)
-            . self::cell('Speed', 8, ConsoleColor::YELLOW, $colors)
-            . self::cell('RX', 17, ConsoleColor::YELLOW, $colors)
-            . self::cell('TX', 16, ConsoleColor::YELLOW, $colors);
+        $lines[] = sprintf(
+            '%-12s %-10s %-8s %-8s %-17s %-16s',
+            ConsoleColor::wrap('Name', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('State', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('MTU', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('Speed', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('RX', ConsoleColor::YELLOW, $colors),
+            ConsoleColor::wrap('TX', ConsoleColor::YELLOW, $colors)
+        );
 
         foreach ($manifest->interfaces as $iface) {
-            $stateColor = match ($iface->operstate) {
+            $stateColor = match($iface->operstate) {
                 'up' => ConsoleColor::GREEN,
                 'down' => ConsoleColor::RED,
                 default => ConsoleColor::WHITE,
             };
-
-            $lines[] = self::cell($iface->name, 12, ConsoleColor::MAGENTA, $colors)
-                . self::cell($iface->operstate, 10, $stateColor, $colors)
-                . self::cell((string)$iface->mtu, 8, null, $colors)
-                . self::cell($iface->speedMbps !== null ? $iface->speedMbps . 'M' : '-', 8, null, $colors)
-                . self::cell(self::humanBytes($iface->rxBytes), 17, null, $colors)
-                . self::cell(self::humanBytes($iface->txBytes), 16, null, $colors);
-            $lines[] = str_repeat(' ', 38) . self::cell('MAC:', 17, ConsoleColor::CYAN, $colors) . $iface->macAddress;
-            $lines[] = str_repeat(' ', 38) . self::cell('IPv4:', 17, ConsoleColor::CYAN, $colors) . implode(', ', $iface->ipv4Addresses);
+            
+            $lines[] = sprintf(
+                '%-12s %-10s %-8d %-8s %-17s %-16s',
+                ConsoleColor::wrap($iface->name, ConsoleColor::MAGENTA, $colors),
+                ConsoleColor::wrap($iface->operstate, $stateColor, $colors),
+                $iface->mtu,
+                $iface->speedMbps !== null ? $iface->speedMbps . 'M' : '-',
+                self::humanBytes($iface->rxBytes),
+                self::humanBytes($iface->txBytes)
+            );
+            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', ConsoleColor::wrap('MAC:', ConsoleColor::CYAN, $colors), $iface->macAddress);
+            $lines[] = sprintf('%-12s %-10s %-8s %-8s %-17s %-16s', '', '', '', '', ConsoleColor::wrap('IPv4:', ConsoleColor::CYAN, $colors), implode(', ', $iface->ipv4Addresses));
         }
 
         return implode(PHP_EOL, $lines) . PHP_EOL;
@@ -1039,13 +822,13 @@ final class Exporter
         $lines = [];
         $lines[] = ConsoleColor::wrapBold('MANIFEST DIFF', $colors);
         $lines[] = str_repeat('=', 72);
-        $lines[] = self::label('Old Timestamp:', 20, ConsoleColor::CYAN, $colors) . ' ' . (string)($diff['old_timestamp'] ?? '');
-        $lines[] = self::label('New Timestamp:', 20, ConsoleColor::CYAN, $colors) . ' ' . (string)($diff['new_timestamp'] ?? '');
-        $lines[] = self::label('Duration Seconds:', 20, ConsoleColor::CYAN, $colors) . ' ' . (int)($diff['duration_seconds'] ?? 0);
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('Old Timestamp:', ConsoleColor::CYAN, $colors), (string)($diff['old_timestamp'] ?? ''));
+        $lines[] = sprintf('%-20s %s', ConsoleColor::wrap('New Timestamp:', ConsoleColor::CYAN, $colors), (string)($diff['new_timestamp'] ?? ''));
+        $lines[] = sprintf('%-20s %d', ConsoleColor::wrap('Duration Seconds:', ConsoleColor::CYAN, $colors), (int)($diff['duration_seconds'] ?? 0));
         $lines[] = '';
-        $lines[] = ConsoleColor::wrapBold('STRUCTURAL FIELD CHANGES', $colors);
-        $lines[] = str_repeat('-', 72);
 
+        $lines[] = ConsoleColor::wrapBold('FIELD CHANGES', $colors);
+        $lines[] = str_repeat('-', 72);
         $fieldChanges = $diff['field_changes'] ?? [];
         if (is_array($fieldChanges) && $fieldChanges !== []) {
             foreach ($fieldChanges as $change) {
@@ -1060,7 +843,7 @@ final class Exporter
                 $lines[] = '  new: ' . ConsoleColor::wrap($new, ConsoleColor::GREEN, $colors);
             }
         } else {
-            $lines[] = 'No structural field changes';
+            $lines[] = 'No scalar field changes';
         }
 
         $lines[] = '';
@@ -1122,25 +905,6 @@ final class Exporter
         return implode(PHP_EOL, $lines) . PHP_EOL;
     }
 
-    private static function label(string $text, int $width, string $color, bool $colors): string
-    {
-        return ConsoleColor::wrap(str_pad($text, $width), $color, $colors);
-    }
-
-    private static function cell(string $text, int $width, ?string $color, bool $colors): string
-    {
-        $cell = str_pad(self::truncate($text, max(0, $width - 1)), $width);
-        return $color === null ? $cell : ConsoleColor::wrap($cell, $color, $colors);
-    }
-
-    private static function truncate(string $text, int $maxLength): string
-    {
-        if ($maxLength <= 0 || strlen($text) <= $maxLength) {
-            return $text;
-        }
-        return substr($text, 0, $maxLength);
-    }
-
     private static function humanBytes(int $bytes): string
     {
         $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -1158,11 +922,8 @@ final class Exporter
     private static function stringify(mixed $value): string
     {
         if (is_array($value)) {
-            try {
-                return json_encode($value, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-            } catch (JsonException) {
-                return '[array]';
-            }
+            $json = json_encode($value, JSON_UNESCAPED_SLASHES);
+            return $json === false ? '[array]' : $json;
         }
 
         if ($value === null) {
@@ -1268,6 +1029,1486 @@ TXT;
     }
 }
 
+final class RuntimeClock
+{
+    public static function iso(): string
+    {
+        return gmdate('Y-m-d\TH:i:s\Z');
+    }
+
+    public static function monotonic(): float
+    {
+        return hrtime(true) / 1000000000;
+    }
+
+    public static function seconds(float $start): float
+    {
+        return max(0.0, self::monotonic() - $start);
+    }
+}
+
+final class RuntimeDiagnostics
+{
+    private array $items = [];
+
+    public function add(string $severity, string $code, string $message, array $context = []): void
+    {
+        $this->items[] = [
+            'severity' => strtoupper($severity),
+            'code' => $code,
+            'message' => $message,
+            'context' => $context,
+            'timestamp' => RuntimeClock::iso(),
+        ];
+    }
+
+    public function all(): array
+    {
+        return $this->items;
+    }
+
+    public function countBySeverity(): array
+    {
+        $counts = ['CRITICAL' => 0, 'HIGH' => 0, 'MEDIUM' => 0, 'LOW' => 0, 'INFO' => 0];
+        foreach ($this->items as $item) {
+            $severity = $item['severity'];
+            $counts[$severity] = ($counts[$severity] ?? 0) + 1;
+        }
+        return $counts;
+    }
+}
+
+final class NumericParser
+{
+    public static function unsigned(string $value): ?int
+    {
+        $value = trim($value);
+        if ($value === '' || !ctype_digit($value)) {
+            return null;
+        }
+        $number = filter_var($value, FILTER_VALIDATE_INT);
+        return $number === false || $number < 0 ? null : $number;
+    }
+
+    public static function floating(string $value): ?float
+    {
+        $value = trim($value);
+        if ($value === '' || !is_numeric($value)) {
+            return null;
+        }
+        $number = (float)$value;
+        return is_finite($number) ? $number : null;
+    }
+
+    public static function percentage(float $used, float $total): ?float
+    {
+        if ($total <= 0.0) {
+            return null;
+        }
+        return round(100.0 * $used / $total, 3);
+    }
+
+    public static function human(int|float $value): string
+    {
+        $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+        $amount = (float)$value;
+        $index = 0;
+        while (abs($amount) >= 1024 && $index < count($units) - 1) {
+            $amount /= 1024;
+            $index++;
+        }
+        return number_format($amount, 2, '.', '') . ' ' . $units[$index];
+    }
+}
+
+final class SafeText
+{
+    public static function read(string $path, int $limit = 1048576): ?string
+    {
+        if (!is_file($path) || !is_readable($path)) {
+            return null;
+        }
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            return null;
+        }
+        try {
+            $content = @stream_get_contents($handle, $limit + 1);
+            if ($content === false || strlen($content) > $limit) {
+                return null;
+            }
+            return $content;
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    public static function lines(string $path, int $limit = 1048576): array
+    {
+        $content = self::read($path, $limit);
+        if ($content === null) {
+            return [];
+        }
+        return preg_split('/\r?\n/', trim($content)) ?: [];
+    }
+
+    public static function scalar(string $path): ?string
+    {
+        $content = self::read($path, 8192);
+        return $content === null ? null : trim($content);
+    }
+}
+
+final class LinuxCpuCollector
+{
+    public static function collect(): array
+    {
+        $result = [
+            'logical_cpus' => 0,
+            'model_names' => [],
+            'physical_packages' => [],
+            'cores_per_package' => [],
+            'frequency_mhz' => [],
+            'usage_counters' => [],
+            'pressure' => [],
+        ];
+        $models = [];
+        $packages = [];
+        $cores = [];
+        foreach (SafeText::lines('/proc/cpuinfo', 2097152) as $line) {
+            if (preg_match('/^processor\s*:\s*\d+/', $line)) {
+                $result['logical_cpus']++;
+            }
+            if (preg_match('/^model name\s*:\s*(.+)$/', $line, $match)) {
+                $models[trim($match[1])] = true;
+            }
+            if (preg_match('/^physical id\s*:\s*(\d+)/', $line, $match)) {
+                $packages[$match[1]] = true;
+            }
+            if (preg_match('/^cpu cores\s*:\s*(\d+)/', $line, $match)) {
+                $cores[(int)$match[1]] = true;
+            }
+            if (preg_match('/^cpu MHz\s*:\s*([\d.]+)/', $line, $match)) {
+                $result['frequency_mhz'][] = (float)$match[1];
+            }
+        }
+        $result['model_names'] = array_keys($models);
+        $result['physical_packages'] = array_keys($packages);
+        $result['cores_per_package'] = array_keys($cores);
+        foreach (SafeText::lines('/proc/stat') as $line) {
+            if (preg_match('/^cpu\s+(.+)$/', $line, $match)) {
+                $fields = preg_split('/\s+/', trim($match[1])) ?: [];
+                $names = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal', 'guest', 'guest_nice'];
+                foreach ($names as $index => $name) {
+                    $result['usage_counters'][$name] = isset($fields[$index]) ? (int)$fields[$index] : 0;
+                }
+                break;
+            }
+        }
+        $result['pressure'] = LinuxPressureCollector::collectOne('cpu');
+        return $result;
+    }
+}
+
+final class LinuxPressureCollector
+{
+    public static function collectOne(string $resource): array
+    {
+        if (!in_array($resource, ['cpu', 'memory', 'io'], true)) {
+            return [];
+        }
+        $output = [];
+        foreach (SafeText::lines('/proc/pressure/' . $resource) as $line) {
+            if (!preg_match('/^(some|full)\s+(.+)$/', $line, $match)) {
+                continue;
+            }
+            $record = [];
+            foreach (preg_split('/\s+/', trim($match[2])) ?: [] as $token) {
+                if (!str_contains($token, '=')) {
+                    continue;
+                }
+                [$key, $value] = explode('=', $token, 2);
+                $record[$key] = $key === 'total' ? NumericParser::unsigned($value) : NumericParser::floating($value);
+            }
+            $output[$match[1]] = $record;
+        }
+        return $output;
+    }
+
+    public static function collect(): array
+    {
+        return [
+            'cpu' => self::collectOne('cpu'),
+            'memory' => self::collectOne('memory'),
+            'io' => self::collectOne('io'),
+        ];
+    }
+}
+
+final class LinuxMemoryCollector
+{
+    public static function collect(): array
+    {
+        $values = HostInfo::meminfo();
+        $total = (int)($values['MemTotal'] ?? 0);
+        $available = (int)($values['MemAvailable'] ?? 0);
+        $swapTotal = (int)($values['SwapTotal'] ?? 0);
+        $swapFree = (int)($values['SwapFree'] ?? 0);
+        return [
+            'fields_bytes' => $values,
+            'total_bytes' => $total,
+            'available_bytes' => $available,
+            'used_estimate_bytes' => max(0, $total - $available),
+            'used_estimate_percent' => NumericParser::percentage($total - $available, $total),
+            'swap_total_bytes' => $swapTotal,
+            'swap_free_bytes' => $swapFree,
+            'swap_used_bytes' => max(0, $swapTotal - $swapFree),
+            'swap_used_percent' => NumericParser::percentage($swapTotal - $swapFree, $swapTotal),
+            'pressure' => LinuxPressureCollector::collectOne('memory'),
+        ];
+    }
+}
+
+final class LinuxDiskCollector
+{
+    public static function collect(): array
+    {
+        $records = [];
+        foreach (SafeText::lines('/proc/diskstats', 2097152) as $line) {
+            $fields = preg_split('/\s+/', trim($line)) ?: [];
+            if (count($fields) < 14) {
+                continue;
+            }
+            $name = $fields[2];
+            if (preg_match('/^(loop|ram|fd)\d+$/', $name)) {
+                continue;
+            }
+            $records[$name] = [
+                'name' => $name,
+                'reads_completed' => (int)$fields[3],
+                'reads_merged' => (int)$fields[4],
+                'sectors_read' => (int)$fields[5],
+                'read_time_ms' => (int)$fields[6],
+                'writes_completed' => (int)$fields[7],
+                'writes_merged' => (int)$fields[8],
+                'sectors_written' => (int)$fields[9],
+                'write_time_ms' => (int)$fields[10],
+                'in_flight' => (int)$fields[11],
+                'io_time_ms' => (int)$fields[12],
+                'weighted_io_time_ms' => (int)$fields[13],
+            ];
+        }
+        ksort($records);
+        return ['devices' => array_values($records), 'pressure' => LinuxPressureCollector::collectOne('io')];
+    }
+}
+
+final class LinuxFilesystemCollector
+{
+    public static function collect(): array
+    {
+        $items = [];
+        $seen = [];
+        foreach (SafeText::lines('/proc/self/mountinfo', 4194304) as $line) {
+            $parts = explode(' - ', $line, 2);
+            if (count($parts) !== 2) {
+                continue;
+            }
+            $left = preg_split('/\s+/', $parts[0]) ?: [];
+            $right = preg_split('/\s+/', $parts[1]) ?: [];
+            if (count($left) < 5 || count($right) < 2) {
+                continue;
+            }
+            $mount = self::decodeMount($left[4]);
+            $filesystem = $right[0];
+            $source = self::decodeMount($right[1]);
+            if (isset($seen[$mount])) {
+                continue;
+            }
+            $seen[$mount] = true;
+            $total = @disk_total_space($mount);
+            $free = @disk_free_space($mount);
+            $total = $total === false ? null : (int)$total;
+            $free = $free === false ? null : (int)$free;
+            $used = $total === null || $free === null ? null : max(0, $total - $free);
+            $items[] = [
+                'mount' => $mount,
+                'filesystem' => $filesystem,
+                'source' => $source,
+                'total_bytes' => $total,
+                'free_bytes' => $free,
+                'used_bytes' => $used,
+                'used_percent' => $total === null || $used === null ? null : NumericParser::percentage($used, $total),
+                'readonly' => in_array('ro', explode(',', $left[5] ?? ''), true),
+            ];
+        }
+        usort($items, static fn(array $a, array $b): int => strcmp($a['mount'], $b['mount']));
+        return $items;
+    }
+
+    private static function decodeMount(string $value): string
+    {
+        return preg_replace_callback('/\\\\([0-7]{3})/', static fn(array $m): string => chr(octdec($m[1])), $value) ?? $value;
+    }
+}
+
+final class LinuxNetworkCollector
+{
+    public static function collect(): array
+    {
+        $interfaces = [];
+        $base = '/sys/class/net';
+        foreach (@scandir($base) ?: [] as $name) {
+            if ($name === '.' || $name === '..' || !preg_match('/^[a-zA-Z0-9_.:@-]+$/', $name)) {
+                continue;
+            }
+            $path = $base . '/' . $name;
+            if (!is_dir($path)) {
+                continue;
+            }
+            $interfaces[$name] = [
+                'name' => $name,
+                'mac_address' => SafeText::scalar($path . '/address'),
+                'operstate' => SafeText::scalar($path . '/operstate'),
+                'carrier' => NumericParser::unsigned(SafeText::scalar($path . '/carrier') ?? ''),
+                'mtu' => NumericParser::unsigned(SafeText::scalar($path . '/mtu') ?? ''),
+                'speed_mbps' => NumericParser::unsigned(SafeText::scalar($path . '/speed') ?? ''),
+                'flags' => SafeText::scalar($path . '/flags'),
+                'rx_bytes' => NumericParser::unsigned(SafeText::scalar($path . '/statistics/rx_bytes') ?? ''),
+                'tx_bytes' => NumericParser::unsigned(SafeText::scalar($path . '/statistics/tx_bytes') ?? ''),
+                'rx_packets' => NumericParser::unsigned(SafeText::scalar($path . '/statistics/rx_packets') ?? ''),
+                'tx_packets' => NumericParser::unsigned(SafeText::scalar($path . '/statistics/tx_packets') ?? ''),
+                'rx_errors' => NumericParser::unsigned(SafeText::scalar($path . '/statistics/rx_errors') ?? ''),
+                'tx_errors' => NumericParser::unsigned(SafeText::scalar($path . '/statistics/tx_errors') ?? ''),
+                'ipv4' => [],
+                'ipv6' => [],
+            ];
+        }
+        $addresses = self::ipAddresses();
+        foreach ($addresses as $name => $families) {
+            if (!isset($interfaces[$name])) {
+                continue;
+            }
+            $interfaces[$name]['ipv4'] = $families['ipv4'];
+            $interfaces[$name]['ipv6'] = $families['ipv6'];
+        }
+        ksort($interfaces);
+        return array_values($interfaces);
+    }
+
+    private static function ipAddresses(): array
+    {
+        $result = [];
+        $command = 'ip -o address show';
+        $execution = ReliableCommand::run($command, 4);
+        if ($execution['exit_code'] !== 0) {
+            return $result;
+        }
+        foreach ($execution['stdout_lines'] as $line) {
+            if (!preg_match('/^\d+:\s+(\S+)\s+(inet6?)\s+(\S+)/', $line, $match)) {
+                continue;
+            }
+            $name = preg_replace('/@.*$/', '', $match[1]);
+            $family = $match[2] === 'inet6' ? 'ipv6' : 'ipv4';
+            $result[$name] ??= ['ipv4' => [], 'ipv6' => []];
+            $result[$name][$family][$match[3]] = true;
+        }
+        foreach ($result as &$families) {
+            foreach (['ipv4', 'ipv6'] as $family) {
+                $families[$family] = array_keys($families[$family]);
+                sort($families[$family]);
+            }
+        }
+        unset($families);
+        return $result;
+    }
+}
+
+final class ReliableCommand
+{
+    public static function run(string $command, int $timeout = 5, int $maxBytes = 2097152): array
+    {
+        $start = RuntimeClock::monotonic();
+        $pipes = [];
+        $process = @proc_open($command, [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ], $pipes);
+        if (!is_resource($process)) {
+            return self::result(null, '', 'Unable to launch command', false, false, $start);
+        }
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+        $stdout = '';
+        $stderr = '';
+        $timedOut = false;
+        $truncated = false;
+        $lastExit = null;
+        try {
+            while (true) {
+                $status = proc_get_status($process);
+                if (!$status['running'] && $status['exitcode'] >= 0) {
+                    $lastExit = $status['exitcode'];
+                }
+                $read = [];
+                foreach ([1, 2] as $index) {
+                    if (!feof($pipes[$index])) {
+                        $read[] = $pipes[$index];
+                    }
+                }
+                if ($read !== []) {
+                    $write = null;
+                    $except = null;
+                    $selected = @stream_select($read, $write, $except, 0, 100000);
+                    if ($selected !== false && $selected > 0) {
+                        foreach ($read as $stream) {
+                            $chunk = fread($stream, 65536);
+                            if (!is_string($chunk) || $chunk === '') {
+                                continue;
+                            }
+                            if ($stream === $pipes[1]) {
+                                $stdout .= $chunk;
+                            } else {
+                                $stderr .= $chunk;
+                            }
+                        }
+                    }
+                }
+                if (strlen($stdout) + strlen($stderr) > $maxBytes) {
+                    $truncated = true;
+                    @proc_terminate($process, 9);
+                    break;
+                }
+                if (RuntimeClock::seconds($start) >= $timeout) {
+                    $timedOut = true;
+                    @proc_terminate($process, 9);
+                    break;
+                }
+                if (!$status['running'] && feof($pipes[1]) && feof($pipes[2])) {
+                    break;
+                }
+            }
+            foreach ([1, 2] as $index) {
+                while (!feof($pipes[$index])) {
+                    $chunk = fread($pipes[$index], 65536);
+                    if (!is_string($chunk) || $chunk === '') {
+                        break;
+                    }
+                    if ($index === 1) {
+                        $stdout .= $chunk;
+                    } else {
+                        $stderr .= $chunk;
+                    }
+                    if (strlen($stdout) + strlen($stderr) > $maxBytes) {
+                        $truncated = true;
+                        break;
+                    }
+                }
+            }
+        } finally {
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+        }
+        $exit = proc_close($process);
+        if ($exit === -1 && $lastExit !== null) {
+            $exit = $lastExit;
+        }
+        return self::result($exit, $stdout, $stderr, $timedOut, $truncated, $start);
+    }
+
+    private static function result(?int $exit, string $stdout, string $stderr, bool $timedOut, bool $truncated, float $start): array
+    {
+        return [
+            'exit_code' => $exit,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+            'stdout_lines' => $stdout === '' ? [] : preg_split('/\r?\n/', trim($stdout)),
+            'timed_out' => $timedOut,
+            'truncated' => $truncated,
+            'duration_seconds' => RuntimeClock::seconds($start),
+        ];
+    }
+}
+
+final class LinuxKernelCollector
+{
+    public static function collect(): array
+    {
+        $cmdline = SafeText::scalar('/proc/cmdline');
+        $bootId = SafeText::scalar('/proc/sys/kernel/random/boot_id');
+        $modules = [];
+        foreach (SafeText::lines('/proc/modules', 4194304) as $line) {
+            $fields = preg_split('/\s+/', trim($line)) ?: [];
+            if (count($fields) >= 3) {
+                $modules[] = ['name' => $fields[0], 'size_bytes' => (int)$fields[1], 'references' => (int)$fields[2]];
+            }
+        }
+        return [
+            'release' => php_uname('r'),
+            'version' => php_uname('v'),
+            'architecture' => php_uname('m'),
+            'boot_id' => $bootId,
+            'cmdline' => $cmdline,
+            'modules' => $modules,
+            'modules_count' => count($modules),
+            'pid_max' => NumericParser::unsigned(SafeText::scalar('/proc/sys/kernel/pid_max') ?? ''),
+            'threads_max' => NumericParser::unsigned(SafeText::scalar('/proc/sys/kernel/threads-max') ?? ''),
+            'file_max' => NumericParser::unsigned(SafeText::scalar('/proc/sys/fs/file-max') ?? ''),
+            'uptime_seconds' => HostInfo::uptimeSeconds(),
+        ];
+    }
+}
+
+final class LinuxProcessCollector
+{
+    public static function collect(): array
+    {
+        $total = 0;
+        $states = [];
+        $threads = 0;
+        foreach (@scandir('/proc') ?: [] as $entry) {
+            if (!ctype_digit($entry)) {
+                continue;
+            }
+            $status = SafeText::lines('/proc/' . $entry . '/status', 16384);
+            if ($status === []) {
+                continue;
+            }
+            $total++;
+            foreach ($status as $line) {
+                if (preg_match('/^State:\s+(\S+)/', $line, $match)) {
+                    $states[$match[1]] = ($states[$match[1]] ?? 0) + 1;
+                }
+                if (preg_match('/^Threads:\s+(\d+)/', $line, $match)) {
+                    $threads += (int)$match[1];
+                }
+            }
+        }
+        ksort($states);
+        return ['process_count' => $total, 'thread_count' => $threads, 'states' => $states];
+    }
+}
+
+final class LinuxSecurityCollector
+{
+    public static function collect(): array
+    {
+        $selinux = null;
+        $enforce = SafeText::scalar('/sys/fs/selinux/enforce');
+        if ($enforce !== null) {
+            $selinux = $enforce === '1' ? 'enforcing' : ($enforce === '0' ? 'permissive' : 'unknown');
+        }
+        $lockdown = SafeText::scalar('/sys/kernel/security/lockdown');
+        $lsm = SafeText::scalar('/sys/kernel/security/lsm');
+        $fips = SafeText::scalar('/proc/sys/crypto/fips_enabled');
+        return [
+            'selinux' => $selinux,
+            'lockdown' => $lockdown,
+            'lsm' => $lsm,
+            'fips_enabled' => $fips === null ? null : $fips === '1',
+            'unprivileged_bpf_disabled' => NumericParser::unsigned(SafeText::scalar('/proc/sys/kernel/unprivileged_bpf_disabled') ?? ''),
+            'ptrace_scope' => NumericParser::unsigned(SafeText::scalar('/proc/sys/kernel/yama/ptrace_scope') ?? ''),
+        ];
+    }
+}
+
+final class ExtendedSnapshot
+{
+    public static function capture(RuntimeDiagnostics $diagnostics): array
+    {
+        $started = RuntimeClock::monotonic();
+        $sections = [];
+        $collectors = [
+            'cpu' => [LinuxCpuCollector::class, 'collect'],
+            'memory' => [LinuxMemoryCollector::class, 'collect'],
+            'pressure' => [LinuxPressureCollector::class, 'collect'],
+            'disk' => [LinuxDiskCollector::class, 'collect'],
+            'filesystems' => [LinuxFilesystemCollector::class, 'collect'],
+            'network' => [LinuxNetworkCollector::class, 'collect'],
+            'kernel' => [LinuxKernelCollector::class, 'collect'],
+            'processes' => [LinuxProcessCollector::class, 'collect'],
+            'security' => [LinuxSecurityCollector::class, 'collect'],
+        ];
+        $timings = [];
+        foreach ($collectors as $name => $callable) {
+            $sectionStart = RuntimeClock::monotonic();
+            try {
+                $sections[$name] = $callable();
+            } catch (Throwable $error) {
+                $sections[$name] = null;
+                $diagnostics->add('LOW', 'COLLECT_' . strtoupper($name), $error->getMessage());
+            }
+            $timings[$name] = round(RuntimeClock::seconds($sectionStart), 6);
+        }
+        return [
+            'schema_version' => 2,
+            'collected_at' => RuntimeClock::iso(),
+            'timestamp_epoch' => time(),
+            'hostname' => HostInfo::hostname(),
+            'os_release' => HostInfo::osRelease(),
+            'sections' => $sections,
+            'collection_timings_seconds' => $timings,
+            'collection_duration_seconds' => round(RuntimeClock::seconds($started), 6),
+        ];
+    }
+}
+
+final class DriftClassifier
+{
+    private const CONFIG_PATHS = [
+        'hostname',
+        'os_release',
+        'sections.kernel.release',
+        'sections.kernel.architecture',
+        'sections.kernel.cmdline',
+        'sections.kernel.pid_max',
+        'sections.kernel.threads_max',
+        'sections.kernel.file_max',
+        'sections.security.selinux',
+        'sections.security.fips_enabled',
+        'sections.security.unprivileged_bpf_disabled',
+        'sections.security.ptrace_scope',
+        'sections.security.lsm',
+    ];
+
+    public static function compare(array $before, array $after): array
+    {
+        $changes = [];
+        foreach (self::CONFIG_PATHS as $path) {
+            $a = self::lookup($before, $path);
+            $b = self::lookup($after, $path);
+            if ($a !== $b) {
+                $changes[] = [
+                    'category' => 'configuration',
+                    'path' => $path,
+                    'old' => $a,
+                    'new' => $b,
+                    'severity' => self::severity($path),
+                ];
+            }
+        }
+        $oldNetwork = self::indexByName($before['sections']['network'] ?? []);
+        $newNetwork = self::indexByName($after['sections']['network'] ?? []);
+        $names = array_unique(array_merge(array_keys($oldNetwork), array_keys($newNetwork)));
+        sort($names);
+        foreach ($names as $name) {
+            if (!isset($oldNetwork[$name])) {
+                $changes[] = ['category' => 'configuration', 'path' => 'network.' . $name, 'old' => null, 'new' => 'added', 'severity' => 'MEDIUM'];
+                continue;
+            }
+            if (!isset($newNetwork[$name])) {
+                $changes[] = ['category' => 'configuration', 'path' => 'network.' . $name, 'old' => 'present', 'new' => null, 'severity' => 'MEDIUM'];
+                continue;
+            }
+            foreach (['mac_address', 'mtu', 'speed_mbps', 'flags', 'ipv4', 'ipv6'] as $field) {
+                $a = $oldNetwork[$name][$field] ?? null;
+                $b = $newNetwork[$name][$field] ?? null;
+                if ($a !== $b) {
+                    $changes[] = [
+                        'category' => 'configuration',
+                        'path' => 'network.' . $name . '.' . $field,
+                        'old' => $a,
+                        'new' => $b,
+                        'severity' => 'MEDIUM',
+                    ];
+                }
+            }
+        }
+        $oldFilesystems = self::indexByKey($before['sections']['filesystems'] ?? [], 'mount');
+        $newFilesystems = self::indexByKey($after['sections']['filesystems'] ?? [], 'mount');
+        $mounts = array_unique(array_merge(array_keys($oldFilesystems), array_keys($newFilesystems)));
+        sort($mounts);
+        foreach ($mounts as $mount) {
+            if (!isset($oldFilesystems[$mount]) || !isset($newFilesystems[$mount])) {
+                $changes[] = [
+                    'category' => 'configuration',
+                    'path' => 'filesystems.' . $mount,
+                    'old' => isset($oldFilesystems[$mount]) ? 'present' : null,
+                    'new' => isset($newFilesystems[$mount]) ? 'present' : null,
+                    'severity' => 'MEDIUM',
+                ];
+                continue;
+            }
+            foreach (['filesystem', 'source', 'readonly'] as $field) {
+                $a = $oldFilesystems[$mount][$field] ?? null;
+                $b = $newFilesystems[$mount][$field] ?? null;
+                if ($a !== $b) {
+                    $changes[] = [
+                        'category' => 'configuration',
+                        'path' => 'filesystems.' . $mount . '.' . $field,
+                        'old' => $a,
+                        'new' => $b,
+                        'severity' => 'MEDIUM',
+                    ];
+                }
+            }
+        }
+        $runtime = RuntimeDelta::compare($before, $after);
+        return [
+            'old_timestamp' => $before['collected_at'] ?? null,
+            'new_timestamp' => $after['collected_at'] ?? null,
+            'duration_seconds' => (int)($after['timestamp_epoch'] ?? 0) - (int)($before['timestamp_epoch'] ?? 0),
+            'configuration_changes' => $changes,
+            'configuration_change_count' => count($changes),
+            'runtime_deltas' => $runtime,
+        ];
+    }
+
+    private static function lookup(array $array, string $path): mixed
+    {
+        foreach (explode('.', $path) as $segment) {
+            if (!is_array($array) || !array_key_exists($segment, $array)) {
+                return null;
+            }
+            $array = $array[$segment];
+        }
+        return $array;
+    }
+
+    private static function severity(string $path): string
+    {
+        if (str_contains($path, 'security.') || str_contains($path, 'kernel.release')) {
+            return 'HIGH';
+        }
+        return 'MEDIUM';
+    }
+
+    private static function indexByName(mixed $items): array
+    {
+        return self::indexByKey($items, 'name');
+    }
+
+    private static function indexByKey(mixed $items, string $key): array
+    {
+        $result = [];
+        foreach (is_array($items) ? $items : [] as $item) {
+            if (is_array($item) && isset($item[$key]) && is_string($item[$key])) {
+                $result[$item[$key]] = $item;
+            }
+        }
+        return $result;
+    }
+}
+
+final class RuntimeDelta
+{
+    public static function compare(array $before, array $after): array
+    {
+        $duration = max(0, (int)($after['timestamp_epoch'] ?? 0) - (int)($before['timestamp_epoch'] ?? 0));
+        $deltas = [
+            'duration_seconds' => $duration,
+            'network' => [],
+            'cpu' => [],
+            'memory' => [],
+            'processes' => [],
+        ];
+        $oldNetwork = self::networkIndex($before);
+        $newNetwork = self::networkIndex($after);
+        foreach ($newNetwork as $name => $interface) {
+            if (!isset($oldNetwork[$name])) {
+                continue;
+            }
+            $record = [];
+            foreach (['rx_bytes', 'tx_bytes', 'rx_packets', 'tx_packets', 'rx_errors', 'tx_errors'] as $field) {
+                $old = $oldNetwork[$name][$field] ?? null;
+                $new = $interface[$field] ?? null;
+                $record[$field . '_delta'] = self::counterDelta($old, $new);
+                $record[$field . '_per_second'] = $duration > 0 && $record[$field . '_delta'] !== null
+                    ? round($record[$field . '_delta'] / $duration, 3)
+                    : null;
+            }
+            $deltas['network'][$name] = $record;
+        }
+        $oldCpu = $before['sections']['cpu']['usage_counters'] ?? [];
+        $newCpu = $after['sections']['cpu']['usage_counters'] ?? [];
+        foreach ($newCpu as $field => $value) {
+            $deltas['cpu'][$field] = self::counterDelta($oldCpu[$field] ?? null, $value);
+        }
+        $total = array_sum(array_filter($deltas['cpu'], 'is_int'));
+        $idle = ($deltas['cpu']['idle'] ?? 0) + ($deltas['cpu']['iowait'] ?? 0);
+        $deltas['cpu']['busy_percent'] = $total > 0 ? round(100 * ($total - $idle) / $total, 3) : null;
+        foreach (['available_bytes', 'used_estimate_bytes', 'swap_used_bytes'] as $field) {
+            $old = $before['sections']['memory'][$field] ?? null;
+            $new = $after['sections']['memory'][$field] ?? null;
+            $deltas['memory'][$field . '_change'] = is_numeric($old) && is_numeric($new) ? $new - $old : null;
+        }
+        foreach (['process_count', 'thread_count'] as $field) {
+            $old = $before['sections']['processes'][$field] ?? null;
+            $new = $after['sections']['processes'][$field] ?? null;
+            $deltas['processes'][$field . '_change'] = is_numeric($old) && is_numeric($new) ? $new - $old : null;
+        }
+        return $deltas;
+    }
+
+    private static function networkIndex(array $snapshot): array
+    {
+        $result = [];
+        foreach ($snapshot['sections']['network'] ?? [] as $interface) {
+            if (is_array($interface) && isset($interface['name'])) {
+                $result[$interface['name']] = $interface;
+            }
+        }
+        return $result;
+    }
+
+    private static function counterDelta(mixed $old, mixed $new): ?int
+    {
+        if (!is_int($old) || !is_int($new) || $new < $old) {
+            return null;
+        }
+        return $new - $old;
+    }
+}
+
+final class FindingEngine
+{
+    public static function analyze(array $snapshot, RuntimeDiagnostics $diagnostics, array $thresholds): array
+    {
+        $findings = [];
+        $memory = $snapshot['sections']['memory'] ?? [];
+        $memoryUsed = $memory['used_estimate_percent'] ?? null;
+        if (is_numeric($memoryUsed) && $memoryUsed >= $thresholds['memory']) {
+            $findings[] = self::finding('MEDIUM', 'MEMORY_USAGE', 'Estimated memory use exceeds threshold', ['percent' => $memoryUsed]);
+        }
+        $swapUsed = $memory['swap_used_percent'] ?? null;
+        if (is_numeric($swapUsed) && $swapUsed >= $thresholds['swap']) {
+            $findings[] = self::finding('MEDIUM', 'SWAP_USAGE', 'Swap utilization exceeds threshold', ['percent' => $swapUsed]);
+        }
+        foreach ($snapshot['sections']['filesystems'] ?? [] as $filesystem) {
+            $percent = $filesystem['used_percent'] ?? null;
+            if (is_numeric($percent) && $percent >= $thresholds['disk']) {
+                $findings[] = self::finding('HIGH', 'FILESYSTEM_USAGE', 'Filesystem utilization exceeds threshold', [
+                    'mount' => $filesystem['mount'],
+                    'percent' => $percent,
+                ]);
+            }
+        }
+        $security = $snapshot['sections']['security'] ?? [];
+        if (($security['selinux'] ?? null) === 'permissive') {
+            $findings[] = self::finding('INFO', 'SELINUX_PERMISSIVE', 'SELinux is in permissive mode', []);
+        }
+        foreach ($snapshot['sections']['network'] ?? [] as $interface) {
+            if (($interface['operstate'] ?? null) === 'down' && ($interface['name'] ?? '') !== 'lo') {
+                $findings[] = self::finding('INFO', 'INTERFACE_DOWN', 'Interface reports down state', ['interface' => $interface['name']]);
+            }
+            foreach (['rx_errors', 'tx_errors'] as $counter) {
+                if (($interface[$counter] ?? 0) > 0) {
+                    $findings[] = self::finding('LOW', 'INTERFACE_ERRORS', 'Network interface reports cumulative errors', [
+                        'interface' => $interface['name'],
+                        'counter' => $counter,
+                        'count' => $interface[$counter],
+                    ]);
+                }
+            }
+        }
+        foreach ($diagnostics->all() as $diagnostic) {
+            $findings[] = $diagnostic;
+        }
+        return $findings;
+    }
+
+    private static function finding(string $severity, string $code, string $message, array $context): array
+    {
+        return [
+            'severity' => $severity,
+            'code' => $code,
+            'message' => $message,
+            'context' => $context,
+            'timestamp' => RuntimeClock::iso(),
+        ];
+    }
+}
+
+final class SnapshotFingerprint
+{
+    public static function configHash(array $snapshot): string
+    {
+        $reduced = [
+            'hostname' => $snapshot['hostname'] ?? null,
+            'os_release' => $snapshot['os_release'] ?? null,
+            'kernel_release' => $snapshot['sections']['kernel']['release'] ?? null,
+            'kernel_cmdline' => $snapshot['sections']['kernel']['cmdline'] ?? null,
+            'security' => $snapshot['sections']['security'] ?? null,
+            'network' => [],
+            'filesystems' => [],
+        ];
+        foreach ($snapshot['sections']['network'] ?? [] as $interface) {
+            $reduced['network'][] = array_intersect_key($interface, array_flip([
+                'name', 'mac_address', 'mtu', 'speed_mbps', 'flags', 'ipv4', 'ipv6',
+            ]));
+        }
+        foreach ($snapshot['sections']['filesystems'] ?? [] as $filesystem) {
+            $reduced['filesystems'][] = array_intersect_key($filesystem, array_flip([
+                'mount', 'filesystem', 'source', 'readonly',
+            ]));
+        }
+        return hash('sha256', json_encode($reduced, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+    }
+}
+
+final class HistoryDatabase
+{
+    private PDO $pdo;
+
+    public function __construct(string $path)
+    {
+        if (!extension_loaded('pdo_sqlite')) {
+            throw new RuntimeException('SQLite history requires the pdo_sqlite PHP extension');
+        }
+        $directory = dirname($path);
+        if ($directory !== '.' && !is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) {
+            throw new RuntimeException('Unable to create database directory: ' . $directory);
+        }
+        $this->pdo = new PDO('sqlite:' . $path, null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+        $this->pdo->exec('PRAGMA busy_timeout = 5000');
+        $this->pdo->exec('CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )');
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_snapshots_host_id ON snapshots(hostname, id)');
+        $this->pdo->exec('CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            code TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )');
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_events_host_id ON events(hostname, id)');
+    }
+
+    public function latest(string $hostname): ?array
+    {
+        $statement = $this->pdo->prepare('SELECT payload FROM snapshots WHERE hostname = :hostname ORDER BY id DESC LIMIT 1');
+        $statement->execute(['hostname' => $hostname]);
+        $row = $statement->fetch();
+        if (!is_array($row)) {
+            return null;
+        }
+        $data = json_decode($row['payload'], true, 512, JSON_THROW_ON_ERROR);
+        return is_array($data) ? $data : null;
+    }
+
+    public function store(array $snapshot, array $findings): int
+    {
+        $hostname = (string)($snapshot['hostname'] ?? 'unknown');
+        $this->pdo->beginTransaction();
+        try {
+            $statement = $this->pdo->prepare('INSERT INTO snapshots (created_at, hostname, fingerprint, payload)
+                VALUES (:created_at, :hostname, :fingerprint, :payload)');
+            $statement->execute([
+                'created_at' => $snapshot['collected_at'],
+                'hostname' => $hostname,
+                'fingerprint' => SnapshotFingerprint::configHash($snapshot),
+                'payload' => json_encode($snapshot, JSON_THROW_ON_ERROR),
+            ]);
+            $id = (int)$this->pdo->lastInsertId();
+            $eventStatement = $this->pdo->prepare('INSERT INTO events (created_at, hostname, severity, code, payload)
+                VALUES (:created_at, :hostname, :severity, :code, :payload)');
+            foreach ($findings as $finding) {
+                $eventStatement->execute([
+                    'created_at' => $finding['timestamp'] ?? RuntimeClock::iso(),
+                    'hostname' => $hostname,
+                    'severity' => $finding['severity'] ?? 'INFO',
+                    'code' => $finding['code'] ?? 'UNKNOWN',
+                    'payload' => json_encode($finding, JSON_THROW_ON_ERROR),
+                ]);
+            }
+            $this->pdo->commit();
+            return $id;
+        } catch (Throwable $error) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $error;
+        }
+    }
+
+    public function recent(string $hostname, int $limit): array
+    {
+        $statement = $this->pdo->prepare('SELECT id, created_at, fingerprint, payload
+            FROM snapshots WHERE hostname = :hostname ORDER BY id DESC LIMIT :limit');
+        $statement->bindValue(':hostname', $hostname, PDO::PARAM_STR);
+        $statement->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $statement->execute();
+        $rows = [];
+        foreach ($statement->fetchAll() as $row) {
+            $payload = json_decode($row['payload'], true);
+            $rows[] = [
+                'id' => (int)$row['id'],
+                'created_at' => $row['created_at'],
+                'fingerprint' => $row['fingerprint'],
+                'snapshot' => $payload,
+            ];
+        }
+        return $rows;
+    }
+
+    public function prune(int $keep): int
+    {
+        $statement = $this->pdo->prepare('DELETE FROM snapshots WHERE id NOT IN (
+            SELECT id FROM snapshots ORDER BY id DESC LIMIT :keep
+        )');
+        $statement->bindValue(':keep', $keep, PDO::PARAM_INT);
+        $statement->execute();
+        return $statement->rowCount();
+    }
+}
+
+final class CsvWriter
+{
+    public static function encode(array $rows): string
+    {
+        $handle = fopen('php://temp', 'w+');
+        if ($handle === false) {
+            throw new RuntimeException('Unable to create temporary CSV buffer');
+        }
+        try {
+            $headers = [];
+            foreach ($rows as $row) {
+                foreach (array_keys($row) as $key) {
+                    $headers[$key] = true;
+                }
+            }
+            if ($headers === []) {
+                return '';
+            }
+            $columns = array_keys($headers);
+            fputcsv($handle, $columns, ',', '"', '');
+            foreach ($rows as $row) {
+                $values = [];
+                foreach ($columns as $column) {
+                    $value = $row[$column] ?? null;
+                    $values[] = is_array($value) ? json_encode($value, JSON_UNESCAPED_SLASHES) : $value;
+                }
+                fputcsv($handle, $values, ',', '"', '');
+            }
+            rewind($handle);
+            return stream_get_contents($handle) ?: '';
+        } finally {
+            fclose($handle);
+        }
+    }
+}
+
+final class ExtendedReporter
+{
+    public static function render(array $report, string $format, bool $colors): string
+    {
+        return match ($format) {
+            'json' => json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL,
+            'csv' => self::csv($report),
+            'table' => self::table($report, $colors),
+            default => throw new InvalidArgumentException('Unsupported extended report format: ' . $format),
+        };
+    }
+
+    private static function csv(array $report): string
+    {
+        $snapshot = $report['snapshot'];
+        $rows = [];
+        foreach ($snapshot['sections']['network'] ?? [] as $interface) {
+            $rows[] = [
+                'timestamp' => $snapshot['collected_at'],
+                'hostname' => $snapshot['hostname'],
+                'section' => 'network',
+                'name' => $interface['name'],
+                'state' => $interface['operstate'],
+                'value' => $interface['rx_bytes'],
+                'value2' => $interface['tx_bytes'],
+                'details' => ['ipv4' => $interface['ipv4'], 'ipv6' => $interface['ipv6']],
+            ];
+        }
+        foreach ($snapshot['sections']['filesystems'] ?? [] as $filesystem) {
+            $rows[] = [
+                'timestamp' => $snapshot['collected_at'],
+                'hostname' => $snapshot['hostname'],
+                'section' => 'filesystem',
+                'name' => $filesystem['mount'],
+                'state' => $filesystem['filesystem'],
+                'value' => $filesystem['used_percent'],
+                'value2' => $filesystem['free_bytes'],
+                'details' => ['source' => $filesystem['source']],
+            ];
+        }
+        foreach ($report['findings'] ?? [] as $finding) {
+            $rows[] = [
+                'timestamp' => $snapshot['collected_at'],
+                'hostname' => $snapshot['hostname'],
+                'section' => 'finding',
+                'name' => $finding['code'],
+                'state' => $finding['severity'],
+                'value' => null,
+                'value2' => null,
+                'details' => $finding['context'],
+            ];
+        }
+        return CsvWriter::encode($rows);
+    }
+
+    private static function table(array $report, bool $colors): string
+    {
+        $snapshot = $report['snapshot'];
+        $sections = $snapshot['sections'];
+        $lines = [];
+        $lines[] = ConsoleColor::wrapBold('OBSERVER-PHP EXTENDED SYSTEM REPORT', $colors);
+        $lines[] = str_repeat('=', 78);
+        $lines[] = 'Host:       ' . $snapshot['hostname'];
+        $lines[] = 'OS:         ' . $snapshot['os_release'];
+        $lines[] = 'Kernel:     ' . ($sections['kernel']['release'] ?? 'unknown');
+        $lines[] = 'Collected:  ' . $snapshot['collected_at'];
+        $lines[] = 'Duration:   ' . number_format($snapshot['collection_duration_seconds'], 4) . ' s';
+        $lines[] = 'Fingerprint: ' . ($report['fingerprint'] ?? '');
+        $lines[] = '';
+        $lines[] = ConsoleColor::wrapBold('CPU AND MEMORY', $colors);
+        $lines[] = str_repeat('-', 78);
+        $lines[] = 'Logical CPUs: ' . ($sections['cpu']['logical_cpus'] ?? 0);
+        $lines[] = 'CPU models:   ' . implode(', ', $sections['cpu']['model_names'] ?? []);
+        $lines[] = 'Memory used:  ' . NumericParser::human($sections['memory']['used_estimate_bytes'] ?? 0);
+        $lines[] = 'Memory total: ' . NumericParser::human($sections['memory']['total_bytes'] ?? 0);
+        $lines[] = 'Memory load:  ' . self::percent($sections['memory']['used_estimate_percent'] ?? null);
+        $lines[] = 'Swap load:    ' . self::percent($sections['memory']['swap_used_percent'] ?? null);
+        $lines[] = 'Processes:    ' . ($sections['processes']['process_count'] ?? 0);
+        $lines[] = 'Threads:      ' . ($sections['processes']['thread_count'] ?? 0);
+        $lines[] = '';
+        $lines[] = ConsoleColor::wrapBold('NETWORK INTERFACES', $colors);
+        $lines[] = str_repeat('-', 78);
+        foreach ($sections['network'] ?? [] as $interface) {
+            $lines[] = sprintf('%-16s %-9s RX %-12s TX %-12s',
+                $interface['name'],
+                $interface['operstate'] ?? '?',
+                NumericParser::human($interface['rx_bytes'] ?? 0),
+                NumericParser::human($interface['tx_bytes'] ?? 0));
+            $lines[] = '  IPv4: ' . implode(', ', $interface['ipv4']);
+            $lines[] = '  IPv6: ' . implode(', ', $interface['ipv6']);
+        }
+        $lines[] = '';
+        $lines[] = ConsoleColor::wrapBold('FILESYSTEMS', $colors);
+        $lines[] = str_repeat('-', 78);
+        foreach ($sections['filesystems'] ?? [] as $filesystem) {
+            $lines[] = sprintf('%-26s %-12s %8s  %s',
+                substr($filesystem['mount'], 0, 26),
+                $filesystem['filesystem'],
+                self::percent($filesystem['used_percent']),
+                $filesystem['source']);
+        }
+        $lines[] = '';
+        $lines[] = ConsoleColor::wrapBold('FINDINGS', $colors);
+        $lines[] = str_repeat('-', 78);
+        if (($report['findings'] ?? []) === []) {
+            $lines[] = 'No threshold findings';
+        }
+        foreach ($report['findings'] ?? [] as $finding) {
+            $lines[] = '[' . $finding['severity'] . '] ' . $finding['code'] . ': ' . $finding['message'];
+        }
+        if (isset($report['drift'])) {
+            $lines[] = '';
+            $lines[] = ConsoleColor::wrapBold('CONFIGURATION DRIFT', $colors);
+            $lines[] = str_repeat('-', 78);
+            $lines[] = 'Changes: ' . $report['drift']['configuration_change_count'];
+            foreach ($report['drift']['configuration_changes'] as $change) {
+                $lines[] = '[' . $change['severity'] . '] ' . $change['path'];
+                $lines[] = '  old: ' . self::value($change['old']);
+                $lines[] = '  new: ' . self::value($change['new']);
+            }
+            $busy = $report['drift']['runtime_deltas']['cpu']['busy_percent'] ?? null;
+            $lines[] = 'CPU busy between snapshots: ' . self::percent($busy);
+        }
+        return implode(PHP_EOL, $lines) . PHP_EOL;
+    }
+
+    private static function percent(mixed $value): string
+    {
+        return is_numeric($value) ? number_format((float)$value, 2) . '%' : 'n/a';
+    }
+
+    private static function value(mixed $value): string
+    {
+        if (is_array($value)) {
+            return json_encode($value, JSON_UNESCAPED_SLASHES) ?: '[]';
+        }
+        if ($value === null) {
+            return 'null';
+        }
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+        return (string)$value;
+    }
+}
+
+final class ExtendedOptions
+{
+    public static function parse(array $argv): array
+    {
+        $options = [
+            'extended' => false,
+            'watch' => false,
+            'interval' => 5.0,
+            'count' => 1,
+            'format' => 'table',
+            'database' => null,
+            'history' => 0,
+            'retention' => 0,
+            'output' => null,
+            'compare' => null,
+            'memory_threshold' => 90.0,
+            'swap_threshold' => 75.0,
+            'disk_threshold' => 90.0,
+            'color' => false,
+            'help' => false,
+        ];
+        $valueKeys = [
+            'interval', 'count', 'format', 'database', 'history', 'retention', 'output',
+            'compare', 'memory-threshold', 'swap-threshold', 'disk-threshold',
+        ];
+        for ($index = 1; $index < count($argv); $index++) {
+            $argument = $argv[$index];
+            if (!str_starts_with($argument, '--')) {
+                throw new InvalidArgumentException('Unexpected argument: ' . $argument);
+            }
+            $raw = substr($argument, 2);
+            $position = strpos($raw, '=');
+            $name = $position === false ? $raw : substr($raw, 0, $position);
+            $value = $position === false ? null : substr($raw, $position + 1);
+            if ($name === 'extended') {
+                $options['extended'] = true;
+                continue;
+            }
+            if ($name === 'watch') {
+                $options['watch'] = true;
+                $options['extended'] = true;
+                continue;
+            }
+            if ($name === 'no-color') {
+                $options['color'] = false;
+                continue;
+            }
+            if ($name === 'force-color') {
+                $options['color'] = true;
+                continue;
+            }
+            if ($name === 'help') {
+                $options['help'] = true;
+                continue;
+            }
+            if (!in_array($name, $valueKeys, true)) {
+                throw new InvalidArgumentException('Unknown option: --' . $name);
+            }
+            if ($value === null) {
+                if (!isset($argv[$index + 1]) || str_starts_with($argv[$index + 1], '--')) {
+                    throw new InvalidArgumentException('Missing value for --' . $name);
+                }
+                $value = $argv[++$index];
+            }
+            $key = str_replace('-', '_', $name);
+            $options[$key] = $value;
+            if (in_array($name, ['database', 'history', 'retention', 'memory-threshold', 'swap-threshold', 'disk-threshold'], true)) {
+                $options['extended'] = true;
+            }
+        }
+        if (!in_array($options['format'], ['table', 'json', 'csv'], true)) {
+            throw new InvalidArgumentException('Format must be table, json, or csv');
+        }
+        foreach (['interval', 'memory_threshold', 'swap_threshold', 'disk_threshold'] as $name) {
+            if (!is_numeric($options[$name])) {
+                throw new InvalidArgumentException('Invalid numeric value: ' . $name);
+            }
+            $options[$name] = (float)$options[$name];
+        }
+        foreach (['count', 'history', 'retention'] as $name) {
+            $number = filter_var($options[$name], FILTER_VALIDATE_INT);
+            if ($number === false || $number < 0) {
+                throw new InvalidArgumentException('Invalid integer value: ' . $name);
+            }
+            $options[$name] = $number;
+        }
+        if ($options['interval'] < 0.2 || $options['interval'] > 86400) {
+            throw new InvalidArgumentException('Interval must be between 0.2 and 86400 seconds');
+        }
+        foreach (['memory_threshold', 'swap_threshold', 'disk_threshold'] as $name) {
+            if ($options[$name] < 0 || $options[$name] > 100) {
+                throw new InvalidArgumentException('Threshold must be between 0 and 100: ' . $name);
+            }
+        }
+        if ($options['history'] > 0 && $options['database'] === null) {
+            throw new InvalidArgumentException('--history requires --database');
+        }
+        if ($options['retention'] > 0 && $options['database'] === null) {
+            throw new InvalidArgumentException('--retention requires --database');
+        }
+        if ($options['watch'] && $options['output'] !== null) {
+            throw new InvalidArgumentException('--watch cannot be combined with --output');
+        }
+        if ($options['watch'] && $options['compare'] !== null) {
+            throw new InvalidArgumentException('--watch cannot be combined with --compare');
+        }
+        return $options;
+    }
+
+    public static function help(): string
+    {
+        return implode(PHP_EOL, [
+            'observer-php extended Linux system observer',
+            '',
+            'Usage: php main.php --extended [options]',
+            '',
+            '  --extended                 Collect expanded system metrics',
+            '  --format table|json|csv    Select report format',
+            '  --output PATH              Write extended snapshot JSON',
+            '  --compare PATH             Compare with previous extended snapshot',
+            '  --database PATH            Enable SQLite snapshot history',
+            '  --history N                Show N recent snapshots from database',
+            '  --retention N              Keep N most recent snapshots globally',
+            '  --watch                    Enable continuous monitoring',
+            '  --interval SECONDS         Polling interval, default 5',
+            '  --count N                  Watch iterations, 0 means unlimited',
+            '  --memory-threshold PCT     Memory warning threshold',
+            '  --swap-threshold PCT       Swap warning threshold',
+            '  --disk-threshold PCT       Filesystem warning threshold',
+            '  --force-color              Enable ANSI colors',
+            '  --no-color                 Disable ANSI colors',
+            '  --help                     Show help',
+            '',
+            'Legacy mode remains available without --extended.',
+            '',
+        ]) . PHP_EOL;
+    }
+}
+
+final class ExtendedApplication
+{
+    private static bool $stop = false;
+
+    public static function run(array $argv): int
+    {
+        try {
+            if (PHP_SAPI !== 'cli' || PHP_OS_FAMILY !== 'Linux' || PHP_VERSION_ID < 80200) {
+                throw new RuntimeException('Linux CLI with PHP 8.2 or newer is required');
+            }
+            $options = ExtendedOptions::parse($argv);
+            if ($options['help']) {
+                echo ExtendedOptions::help();
+                return 0;
+            }
+            $database = $options['database'] === null ? null : new HistoryDatabase($options['database']);
+            if ($options['history'] > 0) {
+                $rows = $database->recent(HostInfo::hostname(), $options['history']);
+                echo $options['format'] === 'csv'
+                    ? CsvWriter::encode(array_map(static fn(array $row): array => [
+                        'id' => $row['id'],
+                        'created_at' => $row['created_at'],
+                        'fingerprint' => $row['fingerprint'],
+                    ], $rows))
+                    : json_encode($rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL;
+                return 0;
+            }
+            if ($options['watch']) {
+                return self::watch($options, $database);
+            }
+            self::once($options, $database);
+            return 0;
+        } catch (Throwable $error) {
+            fwrite(STDERR, 'error: ' . $error->getMessage() . PHP_EOL);
+            return 1;
+        }
+    }
+
+    private static function once(array $options, ?HistoryDatabase $database): array
+    {
+        $diagnostics = new RuntimeDiagnostics();
+        $snapshot = ExtendedSnapshot::capture($diagnostics);
+        $findings = FindingEngine::analyze($snapshot, $diagnostics, [
+            'memory' => $options['memory_threshold'],
+            'swap' => $options['swap_threshold'],
+            'disk' => $options['disk_threshold'],
+        ]);
+        $report = [
+            'snapshot' => $snapshot,
+            'fingerprint' => SnapshotFingerprint::configHash($snapshot),
+            'findings' => $findings,
+        ];
+        $previous = null;
+        if ($options['compare'] !== null) {
+            $previous = JsonFile::load($options['compare']);
+            if (($previous['schema_version'] ?? null) !== 2) {
+                throw new RuntimeException('Comparison file must contain an extended schema v2 snapshot');
+            }
+        } elseif ($database !== null) {
+            $previous = $database->latest($snapshot['hostname']);
+        }
+        if ($previous !== null) {
+            $report['drift'] = DriftClassifier::compare($previous, $snapshot);
+        }
+        if ($options['output'] !== null) {
+            JsonFile::save($options['output'], $snapshot);
+        }
+        if ($database !== null) {
+            $report['history_id'] = $database->store($snapshot, $findings);
+            if ($options['retention'] > 0) {
+                $report['history_pruned'] = $database->prune($options['retention']);
+            }
+        }
+        echo ExtendedReporter::render($report, $options['format'], $options['color']);
+        return $snapshot;
+    }
+
+    private static function watch(array $options, ?HistoryDatabase $database): int
+    {
+        if (function_exists('pcntl_async_signals') && function_exists('pcntl_signal')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGINT, static function (): void { self::$stop = true; });
+            pcntl_signal(SIGTERM, static function (): void { self::$stop = true; });
+        }
+        $iteration = 0;
+        $previous = null;
+        while (!self::$stop && ($options['count'] === 0 || $iteration < $options['count'])) {
+            $started = RuntimeClock::monotonic();
+            $diagnostics = new RuntimeDiagnostics();
+            $snapshot = ExtendedSnapshot::capture($diagnostics);
+            $findings = FindingEngine::analyze($snapshot, $diagnostics, [
+                'memory' => $options['memory_threshold'],
+                'swap' => $options['swap_threshold'],
+                'disk' => $options['disk_threshold'],
+            ]);
+            $report = [
+                'snapshot' => $snapshot,
+                'fingerprint' => SnapshotFingerprint::configHash($snapshot),
+                'findings' => $findings,
+            ];
+            $baseline = $previous ?? $database?->latest($snapshot['hostname']);
+            if ($baseline !== null) {
+                $report['drift'] = DriftClassifier::compare($baseline, $snapshot);
+            }
+            if ($database !== null) {
+                $report['history_id'] = $database->store($snapshot, $findings);
+                if ($options['retention'] > 0) {
+                    $database->prune($options['retention']);
+                }
+            }
+            echo ExtendedReporter::render($report, $options['format'], $options['color']);
+            $previous = $snapshot;
+            $iteration++;
+            if (self::$stop || ($options['count'] > 0 && $iteration >= $options['count'])) {
+                break;
+            }
+            $remaining = $options['interval'] - RuntimeClock::seconds($started);
+            if ($remaining > 0) {
+                usleep((int)min($remaining * 1000000, 2147483647));
+            }
+        }
+        return 0;
+    }
+}
+
 final class Application
 {
     private static ?string $logger = null;
@@ -1287,7 +2528,6 @@ final class Application
             if (is_string($options['output'])) {
                 JsonFile::save($options['output'], $manifest->toArray());
                 self::log("Manifest saved to {$options['output']}");
-                return 0;
             }
 
             if (is_string($options['compare'])) {
@@ -1337,568 +2577,7 @@ final class Application
     }
 }
 
-final class Observatory
-{
-    private static function text(string $path): ?string
-    {
-        $value = @file_get_contents($path);
-        return $value === false ? null : trim($value);
-    }
-
-    private static function number(string $path): ?int
-    {
-        $value = self::text($path);
-        return $value !== null && preg_match('/^-?\d+$/', $value) ? (int)$value : null;
-    }
-
-    private static function keyed(string $path): array
-    {
-        $text = self::text($path);
-        $result = [];
-        if ($text === null) {
-            return $result;
-        }
-        foreach (preg_split('/\R/', $text) ?: [] as $line) {
-            if (preg_match('/^([^:\s]+):\s*(\d+)/', $line, $m)) {
-                $result[$m[1]] = (int)$m[2];
-            }
-        }
-        return $result;
-    }
-
-    private static function cpu(): array
-    {
-        $stat = self::text('/proc/stat');
-        $totals = [];
-        if ($stat !== null) {
-            foreach (preg_split('/\R/', $stat) ?: [] as $line) {
-                if (!preg_match('/^(cpu\d*)\s+(.+)$/', $line, $m)) {
-                    continue;
-                }
-                $fields = preg_split('/\s+/', trim($m[2])) ?: [];
-                $values = array_map('intval', $fields);
-                $idle = ($values[3] ?? 0) + ($values[4] ?? 0);
-                $totals[$m[1]] = ['total' => array_sum($values), 'idle' => $idle];
-            }
-        }
-        $pressure = self::pressure('/proc/pressure/cpu');
-        return ['ticks' => $totals, 'pressure' => $pressure, 'load' => HostInfo::loadAvg()];
-    }
-
-    private static function pressure(string $path): array
-    {
-        $text = self::text($path);
-        $result = [];
-        if ($text === null) {
-            return $result;
-        }
-        foreach (preg_split('/\R/', $text) ?: [] as $line) {
-            if (!preg_match('/^(some|full)\s+(.+)$/', $line, $m)) {
-                continue;
-            }
-            $values = [];
-            foreach (preg_split('/\s+/', $m[2]) ?: [] as $part) {
-                if (str_contains($part, '=')) {
-                    [$key, $value] = explode('=', $part, 2);
-                    $values[$key] = $key === 'total' ? (int)$value : (float)$value;
-                }
-            }
-            $result[$m[1]] = $values;
-        }
-        return $result;
-    }
-
-    private static function memory(): array
-    {
-        $data = HostInfo::meminfo();
-        $total = $data['MemTotal'] ?? null;
-        $available = $data['MemAvailable'] ?? null;
-        return [
-            'total_bytes' => $total,
-            'available_bytes' => $available,
-            'used_percent' => $total > 0 && $available !== null ? round(100 * ($total - $available) / $total, 3) : null,
-            'swap_total_bytes' => $data['SwapTotal'] ?? null,
-            'swap_free_bytes' => $data['SwapFree'] ?? null,
-            'pressure' => self::pressure('/proc/pressure/memory'),
-            'vmstat' => self::vmstat(),
-        ];
-    }
-
-    private static function vmstat(): array
-    {
-        $text = self::text('/proc/vmstat');
-        $wanted = ['pgfault', 'pgmajfault', 'pswpin', 'pswpout', 'oom_kill'];
-        $result = [];
-        foreach (preg_split('/\R/', $text ?? '') ?: [] as $line) {
-            $parts = preg_split('/\s+/', trim($line));
-            if (count($parts ?: []) === 2 && in_array($parts[0], $wanted, true)) {
-                $result[$parts[0]] = (int)$parts[1];
-            }
-        }
-        return $result;
-    }
-
-    private static function disks(): array
-    {
-        $mounts = self::text('/proc/self/mountinfo');
-        $result = [];
-        $ignored = ['proc', 'sysfs', 'devpts', 'cgroup', 'cgroup2', 'securityfs', 'pstore', 'debugfs', 'tracefs', 'configfs', 'mqueue', 'hugetlbfs', 'fusectl', 'binfmt_misc', 'autofs'];
-        foreach (preg_split('/\R/', $mounts ?? '') ?: [] as $line) {
-            $halves = explode(' - ', $line, 2);
-            if (count($halves) !== 2) {
-                continue;
-            }
-            $left = explode(' ', $halves[0]);
-            $right = explode(' ', $halves[1]);
-            $type = $right[0] ?? '';
-            if (in_array($type, $ignored, true)) {
-                continue;
-            }
-            $mount = str_replace(['\\040', '\\011', '\\012', '\\134'], [' ', "\t", "\n", '\\'], $left[4] ?? '');
-            if ($mount === '' || isset($result[$mount])) {
-                continue;
-            }
-            $total = @disk_total_space($mount);
-            $free = @disk_free_space($mount);
-            $result[$mount] = [
-                'filesystem' => $right[1] ?? '',
-                'type' => $type,
-                'total_bytes' => $total === false ? null : (int)$total,
-                'free_bytes' => $free === false ? null : (int)$free,
-                'used_percent' => $total > 0 && $free !== false ? round(100 * ($total - $free) / $total, 3) : null,
-            ];
-        }
-        ksort($result);
-        return $result;
-    }
-
-    private static function diskIo(): array
-    {
-        $text = self::text('/proc/diskstats');
-        $result = [];
-        foreach (preg_split('/\R/', $text ?? '') ?: [] as $line) {
-            $parts = preg_split('/\s+/', trim($line));
-            if (count($parts ?: []) < 14) {
-                continue;
-            }
-            $name = $parts[2];
-            $result[$name] = [
-                'reads' => (int)$parts[3],
-                'read_bytes' => (int)$parts[5] * 512,
-                'writes' => (int)$parts[7],
-                'write_bytes' => (int)$parts[9] * 512,
-                'io_ms' => (int)$parts[12],
-            ];
-        }
-        ksort($result);
-        return $result;
-    }
-
-    private static function network(): array
-    {
-        $result = [];
-        foreach (@scandir('/sys/class/net') ?: [] as $name) {
-            if ($name === '.' || $name === '..') {
-                continue;
-            }
-            $base = '/sys/class/net/' . $name;
-            $statistics = [];
-            foreach (['rx_bytes', 'tx_bytes', 'rx_packets', 'tx_packets', 'rx_errors', 'tx_errors', 'rx_dropped', 'tx_dropped'] as $key) {
-                $statistics[$key] = self::number($base . '/statistics/' . $key);
-            }
-            $result[$name] = [
-                'state' => self::text($base . '/operstate'),
-                'mac' => self::text($base . '/address'),
-                'mtu' => self::number($base . '/mtu'),
-                'speed_mbps' => ($speed = self::number($base . '/speed')) !== null && $speed >= 0 ? $speed : null,
-                'statistics' => $statistics,
-            ];
-        }
-        ksort($result);
-        return $result;
-    }
-
-    private static function security(): array
-    {
-        $selinux = self::number('/sys/fs/selinux/enforce');
-        $lockdown = self::text('/sys/kernel/security/lockdown');
-        $lsm = self::text('/sys/kernel/security/lsm');
-        return [
-            'selinux_enforcing' => $selinux === null ? null : $selinux === 1,
-            'selinux_policy' => self::text('/sys/fs/selinux/policyvers'),
-            'lockdown' => $lockdown,
-            'lsm' => $lsm === null ? null : array_map('trim', explode(',', $lsm)),
-            'unprivileged_bpf_disabled' => self::number('/proc/sys/kernel/unprivileged_bpf_disabled'),
-            'kptr_restrict' => self::number('/proc/sys/kernel/kptr_restrict'),
-            'dmesg_restrict' => self::number('/proc/sys/kernel/dmesg_restrict'),
-            'yama_ptrace_scope' => self::number('/proc/sys/kernel/yama/ptrace_scope'),
-            'randomize_va_space' => self::number('/proc/sys/kernel/randomize_va_space'),
-        ];
-    }
-
-    private static function processes(): array
-    {
-        $counts = ['total' => 0, 'running' => 0, 'sleeping' => 0, 'uninterruptible' => 0, 'zombie' => 0, 'other' => 0];
-        foreach (@scandir('/proc') ?: [] as $entry) {
-            if (!ctype_digit($entry)) {
-                continue;
-            }
-            $status = self::text('/proc/' . $entry . '/status');
-            if ($status === null || !preg_match('/^State:\s+([A-Z])/m', $status, $m)) {
-                continue;
-            }
-            $counts['total']++;
-            $key = match ($m[1]) {
-                'R' => 'running',
-                'S' => 'sleeping',
-                'D' => 'uninterruptible',
-                'Z' => 'zombie',
-                default => 'other',
-            };
-            $counts[$key]++;
-        }
-        return $counts;
-    }
-
-    public static function capture(): array
-    {
-        $manifest = ManifestBuilder::build()->toArray();
-        return [
-            'schema_version' => 2,
-            'captured_at' => gmdate('c'),
-            'captured_epoch' => microtime(true),
-            'boot_id' => self::text('/proc/sys/kernel/random/boot_id'),
-            'manifest' => $manifest,
-            'cpu' => self::cpu(),
-            'memory' => self::memory(),
-            'mounts' => self::disks(),
-            'disk_io' => self::diskIo(),
-            'network' => self::network(),
-            'security' => self::security(),
-            'processes' => self::processes(),
-            'io_pressure' => self::pressure('/proc/pressure/io'),
-        ];
-    }
-
-    public static function rates(array $old, array $new): array
-    {
-        $elapsed = ($new['captured_epoch'] ?? 0) - ($old['captured_epoch'] ?? 0);
-        if ($elapsed <= 0 || ($old['boot_id'] ?? null) !== ($new['boot_id'] ?? null)) {
-            return ['elapsed_seconds' => max(0, $elapsed), 'available' => false];
-        }
-        $result = ['elapsed_seconds' => round($elapsed, 6), 'available' => true, 'cpu' => [], 'network' => [], 'disk_io' => []];
-        foreach ($new['cpu']['ticks'] ?? [] as $name => $current) {
-            $previous = $old['cpu']['ticks'][$name] ?? null;
-            if (!is_array($previous)) {
-                continue;
-            }
-            $total = $current['total'] - $previous['total'];
-            $idle = $current['idle'] - $previous['idle'];
-            if ($total > 0 && $idle >= 0 && $idle <= $total) {
-                $result['cpu'][$name] = round(100 * ($total - $idle) / $total, 3);
-            }
-        }
-        foreach (['network' => 'statistics', 'disk_io' => null] as $section => $nested) {
-            foreach ($new[$section] ?? [] as $name => $current) {
-                $previous = $old[$section][$name] ?? null;
-                if (!is_array($previous)) {
-                    continue;
-                }
-                $currentCounters = $nested === null ? $current : ($current[$nested] ?? []);
-                $previousCounters = $nested === null ? $previous : ($previous[$nested] ?? []);
-                foreach ($currentCounters as $key => $value) {
-                    $before = $previousCounters[$key] ?? null;
-                    if (is_int($value) && is_int($before) && $value >= $before) {
-                        $result[$section][$name][$key . '_per_sec'] = round(($value - $before) / $elapsed, 3);
-                    }
-                }
-            }
-        }
-        return $result;
-    }
-
-    public static function changes(array $old, array $new): array
-    {
-        $changes = [];
-        foreach (['manifest', 'mounts', 'network', 'security'] as $section) {
-            $a = $old[$section] ?? [];
-            $b = $new[$section] ?? [];
-            if ($section === 'manifest') {
-                foreach (['timestamp', 'timestamp_epoch', 'uptime_seconds', 'loadavg', 'mem_available_bytes'] as $key) {
-                    unset($a[$key], $b[$key]);
-                }
-                foreach (['interfaces'] as $key) {
-                    if (isset($a[$key]) && is_array($a[$key])) {
-                        foreach ($a[$key] as &$iface) {
-                            unset($iface['rx_bytes'], $iface['tx_bytes']);
-                        }
-                        unset($iface);
-                    }
-                    if (isset($b[$key]) && is_array($b[$key])) {
-                        foreach ($b[$key] as &$iface) {
-                            unset($iface['rx_bytes'], $iface['tx_bytes']);
-                        }
-                        unset($iface);
-                    }
-                }
-            }
-            if ($section === 'network') {
-                foreach ($a as &$iface) {
-                    unset($iface['statistics']);
-                }
-                unset($iface);
-                foreach ($b as &$iface) {
-                    unset($iface['statistics']);
-                }
-                unset($iface);
-            }
-            if ($section === 'mounts') {
-                foreach ($a as &$mount) {
-                    unset($mount['free_bytes'], $mount['used_percent']);
-                }
-                unset($mount);
-                foreach ($b as &$mount) {
-                    unset($mount['free_bytes'], $mount['used_percent']);
-                }
-                unset($mount);
-            }
-            self::walkDiff($section, $a, $b, $changes);
-        }
-        return $changes;
-    }
-
-    private static function walkDiff(string $path, mixed $a, mixed $b, array &$changes): void
-    {
-        if (is_array($a) && is_array($b)) {
-            $keys = array_unique(array_merge(array_keys($a), array_keys($b)));
-            sort($keys);
-            foreach ($keys as $key) {
-                $existsA = array_key_exists($key, $a);
-                $existsB = array_key_exists($key, $b);
-                $next = $path . '.' . $key;
-                if (!$existsA || !$existsB) {
-                    $changes[] = ['path' => $next, 'before' => $existsA ? $a[$key] : null, 'after' => $existsB ? $b[$key] : null, 'kind' => $existsA ? 'removed' : 'added'];
-                } else {
-                    self::walkDiff($next, $a[$key], $b[$key], $changes);
-                }
-            }
-        } elseif ($a !== $b) {
-            $changes[] = ['path' => $path, 'before' => $a, 'after' => $b, 'kind' => 'changed'];
-        }
-    }
+if (in_array('--extended', $_SERVER['argv'], true) || in_array('--watch', $_SERVER['argv'], true) || array_filter($_SERVER['argv'], static fn(string $arg): bool => preg_match('/^--(database|history|retention|memory-threshold|swap-threshold|disk-threshold)(=|$)/', $arg) === 1)) {
+    exit(ExtendedApplication::run($_SERVER['argv']));
 }
-
-final class ObservatoryCli
-{
-    private static function options(array $argv): array
-    {
-        $defaults = ['format' => 'table', 'output' => null, 'compare' => null, 'watch' => false, 'interval' => 2.0, 'count' => 0, 'cpu-warn' => 85.0, 'memory-warn' => 90.0, 'disk-warn' => 90.0, 'no-color' => false, 'help' => false];
-        $flags = ['watch', 'no-color', 'help'];
-        for ($i = 1; $i < count($argv); $i++) {
-            $arg = $argv[$i];
-            if (!str_starts_with($arg, '--')) {
-                throw new InvalidArgumentException('Unexpected argument: ' . $arg);
-            }
-            $pair = explode('=', substr($arg, 2), 2);
-            $name = $pair[0];
-            if (!array_key_exists($name, $defaults)) {
-                throw new InvalidArgumentException('Unknown option: --' . $name);
-            }
-            if (in_array($name, $flags, true)) {
-                if (count($pair) > 1) {
-                    throw new InvalidArgumentException('Flag does not accept a value: --' . $name);
-                }
-                $defaults[$name] = true;
-                continue;
-            }
-            $value = $pair[1] ?? ($argv[++$i] ?? null);
-            if ($value === null || str_starts_with($value, '--')) {
-                throw new InvalidArgumentException('Missing value for --' . $name);
-            }
-            $defaults[$name] = $value;
-        }
-        if (!in_array($defaults['format'], ['table', 'json', 'jsonl'], true)) {
-            throw new InvalidArgumentException('Format must be table, json, or jsonl');
-        }
-        foreach (['interval', 'cpu-warn', 'memory-warn', 'disk-warn'] as $name) {
-            if (!is_numeric($defaults[$name])) {
-                throw new InvalidArgumentException('Invalid numeric value for --' . $name);
-            }
-            $defaults[$name] = (float)$defaults[$name];
-            if (!is_finite($defaults[$name]) || $defaults[$name] < 0) {
-                throw new InvalidArgumentException('Invalid range for --' . $name);
-            }
-        }
-        if ($defaults['interval'] < 0.1) {
-            throw new InvalidArgumentException('Interval must be at least 0.1 seconds');
-        }
-        if (filter_var($defaults['count'], FILTER_VALIDATE_INT) === false || (int)$defaults['count'] < 0) {
-            throw new InvalidArgumentException('Count must be a nonnegative integer');
-        }
-        $defaults['count'] = (int)$defaults['count'];
-        if ($defaults['compare'] !== null && $defaults['watch']) {
-            throw new InvalidArgumentException('Compare and watch are mutually exclusive');
-        }
-        return $defaults;
-    }
-
-    private static function encode(array $data, bool $pretty): string
-    {
-        return json_encode($data, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | ($pretty ? JSON_PRETTY_PRINT : 0)) . PHP_EOL;
-    }
-
-    private static function output(string $text, ?string $path, bool $append = false): void
-    {
-        if ($path === null || $path === '-') {
-            echo $text;
-            return;
-        }
-        $directory = dirname($path);
-        if (!is_dir($directory) && !@mkdir($directory, 0755, true) && !is_dir($directory)) {
-            throw new RuntimeException('Cannot create directory: ' . $directory);
-        }
-        if ($append) {
-            if (@file_put_contents($path, $text, FILE_APPEND | LOCK_EX) === false) {
-                throw new RuntimeException('Cannot append to: ' . $path);
-            }
-        } else {
-            $tmp = $path . '.tmp.' . bin2hex(random_bytes(6));
-            try {
-                if (@file_put_contents($tmp, $text, LOCK_EX) === false || !@rename($tmp, $path)) {
-                    throw new RuntimeException('Cannot write: ' . $path);
-                }
-            } finally {
-                @unlink($tmp);
-            }
-        }
-    }
-
-    private static function alerts(array $snapshot, ?array $rates, array $options): array
-    {
-        $alerts = [];
-        $cpu = $rates['cpu']['cpu'] ?? null;
-        if ($cpu !== null && $cpu >= $options['cpu-warn']) {
-            $alerts[] = ['metric' => 'cpu_percent', 'value' => $cpu, 'threshold' => $options['cpu-warn']];
-        }
-        $memory = $snapshot['memory']['used_percent'] ?? null;
-        if ($memory !== null && $memory >= $options['memory-warn']) {
-            $alerts[] = ['metric' => 'memory_used_percent', 'value' => $memory, 'threshold' => $options['memory-warn']];
-        }
-        foreach ($snapshot['mounts'] as $path => $mount) {
-            $used = $mount['used_percent'];
-            if ($used !== null && $used >= $options['disk-warn']) {
-                $alerts[] = ['metric' => 'disk_used_percent', 'mount' => $path, 'value' => $used, 'threshold' => $options['disk-warn']];
-            }
-        }
-        return $alerts;
-    }
-
-    private static function table(array $report): string
-    {
-        $snapshot = $report['snapshot'];
-        $manifest = $snapshot['manifest'];
-        $lines = [
-            'OBSERVER PHP 2.0.0',
-            str_repeat('=', 76),
-            sprintf('Host: %-28s OS: %s', $manifest['hostname'], $manifest['os_release']),
-            sprintf('Kernel: %-26s Captured: %s', $manifest['kernel'], $snapshot['captured_at']),
-            sprintf('CPU: %d cores   Load: %s   Uptime: %.0f s', $manifest['cpu_count'], implode(' / ', $manifest['loadavg']), $manifest['uptime_seconds']),
-            sprintf('Memory used: %s%%   Processes: %d   Zombies: %d', $snapshot['memory']['used_percent'] ?? 'n/a', $snapshot['processes']['total'], $snapshot['processes']['zombie']),
-            sprintf('SELinux enforcing: %s', ($snapshot['security']['selinux_enforcing'] ?? null) === null ? 'unavailable' : ($snapshot['security']['selinux_enforcing'] ? 'yes' : 'no')),
-            '',
-            'NETWORK INTERFACES',
-            str_repeat('-', 76),
-            sprintf('%-17s %-12s %10s %14s %14s', 'Name', 'State', 'MTU', 'RX bytes', 'TX bytes'),
-        ];
-        foreach ($snapshot['network'] as $name => $iface) {
-            $s = $iface['statistics'];
-            $lines[] = sprintf('%-17.17s %-12.12s %10s %14s %14s', $name, $iface['state'] ?? '-', $iface['mtu'] ?? '-', $s['rx_bytes'] ?? '-', $s['tx_bytes'] ?? '-');
-        }
-        $lines[] = '';
-        $lines[] = 'MOUNTS';
-        $lines[] = str_repeat('-', 76);
-        foreach ($snapshot['mounts'] as $path => $mount) {
-            $lines[] = sprintf('%-42.42s %-12.12s %8s%%', $path, $mount['type'], $mount['used_percent'] ?? 'n/a');
-        }
-        if (isset($report['rates'])) {
-            $rates = $report['rates'];
-            $lines[] = '';
-            $lines[] = 'INTERVAL RATES';
-            $lines[] = str_repeat('-', 76);
-            $lines[] = sprintf('Elapsed: %.3f s   CPU busy: %s%%', $rates['elapsed_seconds'], $rates['cpu']['cpu'] ?? 'n/a');
-            foreach ($rates['network'] ?? [] as $name => $values) {
-                $lines[] = sprintf('%-17s RX %12s B/s   TX %12s B/s', $name, $values['rx_bytes_per_sec'] ?? '-', $values['tx_bytes_per_sec'] ?? '-');
-            }
-        }
-        if (isset($report['changes'])) {
-            $lines[] = '';
-            $lines[] = 'STRUCTURAL CHANGES: ' . count($report['changes']);
-            foreach ($report['changes'] as $change) {
-                $lines[] = sprintf('%s %s', strtoupper($change['kind']), $change['path']);
-            }
-        }
-        if (!empty($report['alerts'])) {
-            $lines[] = '';
-            $lines[] = 'THRESHOLD ALERTS';
-            foreach ($report['alerts'] as $alert) {
-                $lines[] = sprintf('%s %s >= %s', $alert['metric'] . (isset($alert['mount']) ? ' ' . $alert['mount'] : ''), $alert['value'], $alert['threshold']);
-            }
-        }
-        return implode(PHP_EOL, $lines) . PHP_EOL;
-    }
-
-    public static function run(array $argv): int
-    {
-        try {
-            if (PHP_SAPI !== 'cli' || PHP_OS_FAMILY !== 'Linux' || PHP_VERSION_ID < 80200) {
-                throw new RuntimeException('Linux CLI and PHP 8.2+ are required');
-            }
-            $options = self::options($argv);
-            if ($options['help']) {
-                echo "Observer PHP 2.0.0\n\n";
-                echo "Usage: php main.php [--format table|json|jsonl] [--output PATH] [--compare PATH]\n";
-                echo "       php main.php --watch [--interval SECONDS] [--count N] [--format table|jsonl]\n";
-                echo "Options: --cpu-warn PERCENT --memory-warn PERCENT --disk-warn PERCENT --no-color --help\n";
-                return 0;
-            }
-            if ($options['watch'] && $options['format'] === 'json') {
-                throw new InvalidArgumentException('Use jsonl or table for continuous monitoring');
-            }
-            $previous = null;
-            if ($options['compare'] !== null) {
-                $previous = JsonFile::load($options['compare']);
-                if (($previous['schema_version'] ?? null) !== 2) {
-                    throw new RuntimeException('Comparison requires a version 2 snapshot');
-                }
-            }
-            $iteration = 0;
-            do {
-                $snapshot = Observatory::capture();
-                $report = ['snapshot' => $snapshot];
-                if ($previous !== null) {
-                    $report['changes'] = Observatory::changes($previous, $snapshot);
-                    $report['rates'] = Observatory::rates($previous, $snapshot);
-                }
-                $report['alerts'] = self::alerts($snapshot, $report['rates'] ?? null, $options);
-                if (!$options['watch'] && $options['compare'] === null && $options['output'] !== null) {
-                    self::output(self::encode($snapshot, true), $options['output']);
-                } else {
-                    $text = $options['format'] === 'table' ? self::table($report) : self::encode($report, $options['format'] === 'json');
-                    self::output($text, $options['output'], $options['watch']);
-                }
-                $previous = $snapshot;
-                $iteration++;
-                if (!$options['watch'] || ($options['count'] > 0 && $iteration >= $options['count'])) {
-                    break;
-                }
-                usleep((int)round($options['interval'] * 1000000));
-            } while (true);
-            return 0;
-        } catch (Throwable $error) {
-            fwrite(STDERR, 'error: ' . $error->getMessage() . PHP_EOL);
-            return 1;
-        }
-    }
-}
-
-exit(ObservatoryCli::run($_SERVER['argv']));
+exit(Application::run($_SERVER['argv']));
