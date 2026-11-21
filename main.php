@@ -128,6 +128,7 @@ final class ProcessExecutor
             return ['output' => [], 'code' => -1, 'errors' => ''];
         }
 
+        fclose($pipes[0]);
         stream_set_blocking($pipes[1], false);
         stream_set_blocking($pipes[2], false);
 
@@ -167,8 +168,8 @@ final class ProcessExecutor
             }
         }
 
-        foreach ($pipes as $pipe) {
-            fclose($pipe);
+        foreach ([1, 2] as $index) {
+            fclose($pipes[$index]);
         }
 
         $code = proc_close($process);
@@ -644,7 +645,6 @@ final class ManifestDiff
             'arch' => [$old->arch, $new->arch],
             'cpu_count' => [$old->cpuCount, $new->cpuCount],
             'mem_total_bytes' => [$old->memTotalBytes, $new->memTotalBytes],
-            'mem_available_bytes' => [$old->memAvailableBytes, $new->memAvailableBytes],
         ] as $field => [$before, $after]) {
             if ($before !== $after) {
                 $fieldChanges[] = [
@@ -1430,7 +1430,7 @@ final class ReliableCommand
     {
         $start = RuntimeClock::monotonic();
         $pipes = [];
-        $process = @proc_open($command, [
+        $process = @proc_open('exec ' . $command, [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
             2 => ['pipe', 'w'],
@@ -1614,6 +1614,50 @@ final class LinuxSecurityCollector
     }
 }
 
+final class LinuxCgroupCollector
+{
+    public static function collect(): array
+    {
+        $root = '/sys/fs/cgroup';
+        if (!is_file($root . '/cgroup.controllers')) {
+            return ['version' => 1, 'supported' => false];
+        }
+        $controllers = preg_split('/\s+/', trim(SafeText::scalar($root . '/cgroup.controllers') ?? '')) ?: [];
+        $memoryCurrent = NumericParser::unsigned(SafeText::scalar($root . '/memory.current') ?? '');
+        $memoryMax = SafeText::scalar($root . '/memory.max');
+        $cpu = [];
+        foreach (SafeText::lines($root . '/cpu.stat') as $line) {
+            $fields = preg_split('/\s+/', trim($line));
+            if (count($fields) === 2) {
+                $cpu[$fields[0]] = NumericParser::unsigned($fields[1]);
+            }
+        }
+        return [
+            'version' => 2,
+            'supported' => true,
+            'controllers' => array_values(array_filter($controllers)),
+            'memory_current_bytes' => $memoryCurrent,
+            'memory_max_bytes' => $memoryMax === 'max' ? null : NumericParser::unsigned($memoryMax ?? ''),
+            'cpu_stat' => $cpu,
+            'pids_current' => NumericParser::unsigned(SafeText::scalar($root . '/pids.current') ?? ''),
+            'pids_max' => SafeText::scalar($root . '/pids.max'),
+            'memory_events' => self::keyValues($root . '/memory.events'),
+        ];
+    }
+
+    private static function keyValues(string $path): array
+    {
+        $values = [];
+        foreach (SafeText::lines($path) as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) === 2) {
+                $values[$parts[0]] = NumericParser::unsigned($parts[1]);
+            }
+        }
+        return $values;
+    }
+}
+
 final class ExtendedSnapshot
 {
     public static function capture(RuntimeDiagnostics $diagnostics): array
@@ -1624,6 +1668,7 @@ final class ExtendedSnapshot
             'cpu' => [LinuxCpuCollector::class, 'collect'],
             'memory' => [LinuxMemoryCollector::class, 'collect'],
             'pressure' => [LinuxPressureCollector::class, 'collect'],
+            'cgroups' => [LinuxCgroupCollector::class, 'collect'],
             'disk' => [LinuxDiskCollector::class, 'collect'],
             'filesystems' => [LinuxFilesystemCollector::class, 'collect'],
             'network' => [LinuxNetworkCollector::class, 'collect'],
@@ -1804,6 +1849,12 @@ final class RuntimeDelta
             'memory' => [],
             'processes' => [],
         ];
+        $beforeBoot = $before['sections']['kernel']['boot_id'] ?? null;
+        $afterBoot = $after['sections']['kernel']['boot_id'] ?? null;
+        if (is_string($beforeBoot) && is_string($afterBoot) && $beforeBoot !== $afterBoot) {
+            $deltas['reset_reason'] = 'kernel boot ID changed';
+            return $deltas;
+        }
         $oldNetwork = self::networkIndex($before);
         $newNetwork = self::networkIndex($after);
         foreach ($newNetwork as $name => $interface) {
@@ -1826,9 +1877,22 @@ final class RuntimeDelta
         foreach ($newCpu as $field => $value) {
             $deltas['cpu'][$field] = self::counterDelta($oldCpu[$field] ?? null, $value);
         }
-        $total = array_sum(array_filter($deltas['cpu'], 'is_int'));
+        $accounted = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal'];
+        $valid = true;
+        $total = 0;
+        foreach ($accounted as $field) {
+            $value = $deltas['cpu'][$field] ?? null;
+            if (!is_int($value)) {
+                $valid = false;
+                break;
+            }
+            $total += $value;
+        }
         $idle = ($deltas['cpu']['idle'] ?? 0) + ($deltas['cpu']['iowait'] ?? 0);
-        $deltas['cpu']['busy_percent'] = $total > 0 ? round(100 * ($total - $idle) / $total, 3) : null;
+        $deltas['cpu']['busy_percent'] = $valid && $total > 0
+            ? round(max(0.0, min(100.0, 100.0 * ($total - $idle) / $total)), 3)
+            : null;
+        $deltas['cpu']['accounting'] = 'guest counters excluded; iowait considered idle';
         foreach (['available_bytes', 'used_estimate_bytes', 'swap_used_bytes'] as $field) {
             $old = $before['sections']['memory'][$field] ?? null;
             $new = $after['sections']['memory'][$field] ?? null;
@@ -1864,7 +1928,7 @@ final class RuntimeDelta
 
 final class FindingEngine
 {
-    public static function analyze(array $snapshot, RuntimeDiagnostics $diagnostics, array $thresholds): array
+    public static function analyze(array $snapshot, RuntimeDiagnostics $diagnostics, array $thresholds, ?array $baseline = null): array
     {
         $findings = [];
         $memory = $snapshot['sections']['memory'] ?? [];
@@ -1877,6 +1941,9 @@ final class FindingEngine
             $findings[] = self::finding('MEDIUM', 'SWAP_USAGE', 'Swap utilization exceeds threshold', ['percent' => $swapUsed]);
         }
         foreach ($snapshot['sections']['filesystems'] ?? [] as $filesystem) {
+            if (in_array($filesystem['filesystem'] ?? '', ['proc', 'sysfs', 'devtmpfs', 'devpts', 'cgroup2', 'securityfs', 'debugfs', 'tracefs', 'configfs', 'pstore', 'mqueue', 'hugetlbfs', 'bpf', 'autofs', 'fusectl', 'binfmt_misc', 'nsfs'], true)) {
+                continue;
+            }
             $percent = $filesystem['used_percent'] ?? null;
             if (is_numeric($percent) && $percent >= $thresholds['disk']) {
                 $findings[] = self::finding('HIGH', 'FILESYSTEM_USAGE', 'Filesystem utilization exceeds threshold', [
@@ -1893,13 +1960,24 @@ final class FindingEngine
             if (($interface['operstate'] ?? null) === 'down' && ($interface['name'] ?? '') !== 'lo') {
                 $findings[] = self::finding('INFO', 'INTERFACE_DOWN', 'Interface reports down state', ['interface' => $interface['name']]);
             }
-            foreach (['rx_errors', 'tx_errors'] as $counter) {
-                if (($interface[$counter] ?? 0) > 0) {
-                    $findings[] = self::finding('LOW', 'INTERFACE_ERRORS', 'Network interface reports cumulative errors', [
-                        'interface' => $interface['name'],
-                        'counter' => $counter,
-                        'count' => $interface[$counter],
-                    ]);
+            if ($baseline !== null) {
+                $prior = [];
+                foreach ($baseline['sections']['network'] ?? [] as $oldInterface) {
+                    if (is_array($oldInterface) && isset($oldInterface['name'])) {
+                        $prior[$oldInterface['name']] = $oldInterface;
+                    }
+                }
+                $name = $interface['name'] ?? '';
+                foreach (['rx_errors', 'tx_errors'] as $counter) {
+                    $old = $prior[$name][$counter] ?? null;
+                    $new = $interface[$counter] ?? null;
+                    if (is_int($old) && is_int($new) && $new > $old) {
+                        $findings[] = self::finding('LOW', 'INTERFACE_NEW_ERRORS', 'New network errors since baseline', [
+                            'interface' => $name,
+                            'counter' => $counter,
+                            'new_errors' => $new - $old,
+                        ]);
+                    }
                 }
             }
         }
@@ -2054,13 +2132,36 @@ final class HistoryDatabase
 
     public function prune(int $keep): int
     {
-        $statement = $this->pdo->prepare('DELETE FROM snapshots WHERE id NOT IN (
-            SELECT id FROM snapshots ORDER BY id DESC LIMIT :keep
-        )');
-        $statement->bindValue(':keep', $keep, PDO::PARAM_INT);
-        $statement->execute();
-        return $statement->rowCount();
+        if ($keep < 1) {
+            return 0;
+        }
+        $this->pdo->beginTransaction();
+        try {
+            $statement = $this->pdo->prepare('DELETE FROM snapshots WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY hostname ORDER BY id DESC) AS rank
+                    FROM snapshots
+                ) WHERE rank > :keep
+            )');
+            $statement->bindValue(':keep', $keep, PDO::PARAM_INT);
+            $statement->execute();
+            $removed = $statement->rowCount();
+            $events = $this->pdo->prepare('DELETE FROM events WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY hostname ORDER BY id DESC) AS rank
+                    FROM events
+                ) WHERE rank > :keep
+            )');
+            $events->bindValue(':keep', $keep, PDO::PARAM_INT);
+            $events->execute();
+            $this->pdo->commit();
+            return $removed;
+        } catch (Throwable $error) {
+            $this->pdo->rollBack();
+            throw $error;
+        }
     }
+
 }
 
 final class CsvWriter
@@ -2367,7 +2468,7 @@ final class ExtendedOptions
             '  --compare PATH             Compare with previous extended snapshot',
             '  --database PATH            Enable SQLite snapshot history',
             '  --history N                Show N recent snapshots from database',
-            '  --retention N              Keep N most recent snapshots globally',
+            '  --retention N              Keep N recent snapshots and events per host',
             '  --watch                    Enable continuous monitoring',
             '  --interval SECONDS         Polling interval, default 5',
             '  --count N                  Watch iterations, 0 means unlimited',
@@ -2426,24 +2527,22 @@ final class ExtendedApplication
     {
         $diagnostics = new RuntimeDiagnostics();
         $snapshot = ExtendedSnapshot::capture($diagnostics);
+        $baseline = $options['compare'] !== null ? JsonFile::load($options['compare']) : $database?->latest($snapshot['hostname']);
         $findings = FindingEngine::analyze($snapshot, $diagnostics, [
             'memory' => $options['memory_threshold'],
             'swap' => $options['swap_threshold'],
             'disk' => $options['disk_threshold'],
-        ]);
+        ], $baseline);
         $report = [
             'snapshot' => $snapshot,
             'fingerprint' => SnapshotFingerprint::configHash($snapshot),
             'findings' => $findings,
         ];
-        $previous = null;
+        $previous = $baseline;
         if ($options['compare'] !== null) {
-            $previous = JsonFile::load($options['compare']);
             if (($previous['schema_version'] ?? null) !== 2) {
                 throw new RuntimeException('Comparison file must contain an extended schema v2 snapshot');
             }
-        } elseif ($database !== null) {
-            $previous = $database->latest($snapshot['hostname']);
         }
         if ($previous !== null) {
             $report['drift'] = DriftClassifier::compare($previous, $snapshot);
@@ -2474,17 +2573,17 @@ final class ExtendedApplication
             $started = RuntimeClock::monotonic();
             $diagnostics = new RuntimeDiagnostics();
             $snapshot = ExtendedSnapshot::capture($diagnostics);
+            $baseline = $previous ?? $database?->latest($snapshot['hostname']);
             $findings = FindingEngine::analyze($snapshot, $diagnostics, [
                 'memory' => $options['memory_threshold'],
                 'swap' => $options['swap_threshold'],
                 'disk' => $options['disk_threshold'],
-            ]);
+            ], $baseline);
             $report = [
                 'snapshot' => $snapshot,
                 'fingerprint' => SnapshotFingerprint::configHash($snapshot),
                 'findings' => $findings,
             ];
-            $baseline = $previous ?? $database?->latest($snapshot['hostname']);
             if ($baseline !== null) {
                 $report['drift'] = DriftClassifier::compare($baseline, $snapshot);
             }
@@ -2577,7 +2676,7 @@ final class Application
     }
 }
 
-if (in_array('--extended', $_SERVER['argv'], true) || in_array('--watch', $_SERVER['argv'], true) || array_filter($_SERVER['argv'], static fn(string $arg): bool => preg_match('/^--(database|history|retention|memory-threshold|swap-threshold|disk-threshold)(=|$)/', $arg) === 1)) {
+if (in_array('--extended', $_SERVER['argv'], true) || in_array('--watch', $_SERVER['argv'], true) || array_filter($_SERVER['argv'], static fn(string $arg): bool => preg_match('/^--(database|history|retention|memory-threshold|swap-threshold|disk-threshold|interval|count)(=|$)/', $arg) === 1)) {
     exit(ExtendedApplication::run($_SERVER['argv']));
 }
 exit(Application::run($_SERVER['argv']));
